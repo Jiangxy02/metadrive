@@ -203,11 +203,12 @@ class TrajectoryReplayEnv(MetaDriveEnv):
                 if vid in self.ghost_vehicles:
                     # 选项1：保持车辆在最后位置（静态）
                     # 车辆将保持在最后已知位置
-                    continue
+                    # continue
                     # 选项2：移除车辆（取消注释下面代码以启用）
-                    # vehicle = self.ghost_vehicles[vid]
-                    # vehicle.destroy()
-                    # del self.ghost_vehicles[vid]
+                    vehicle = self.ghost_vehicles[vid]
+                    vehicle.destroy()
+                    del self.ghost_vehicles[vid]
+                    continue  # 车辆已销毁，跳过后续处理
                 else:
                     continue  # 轨迹结束且车辆不存在，跳过该车
 
