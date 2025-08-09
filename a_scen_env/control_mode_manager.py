@@ -186,18 +186,9 @@ class ControlModeManager:
         # 优先级1: 轨迹重放模式
         if self.use_trajectory_for_main and self.main_vehicle_trajectory:
             if self.step_count < len(self.main_vehicle_trajectory):
-                state = self.main_vehicle_trajectory[self.step_count]
-                
-                # 直接设置主车状态
-                self.agent.set_position([state["x"], state["y"]])
-                self.agent.set_heading_theta(state["heading"])
-                
-                import numpy as np
-                direction = [np.cos(state["heading"]), np.sin(state["heading"])]
-                self.agent.set_velocity(direction, state["speed"])
-                
+                # 轨迹重放模式：状态由主环境step函数统一设置，这里只返回标识
                 action_info = {"source": "trajectory", "success": True}
-                return [0.0, 0.0], action_info  # 空动作，因为位置已直接设置
+                return [0.0, 0.0], action_info  # 空动作，状态由环境直接设置
                 
         # 优先级2: PPO 专家模式
         elif self.expert_mode and hasattr(self.agent, 'expert_takeover') and self.agent.expert_takeover:
