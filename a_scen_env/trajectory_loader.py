@@ -257,19 +257,101 @@ class TrajectoryLoader:
         for vid, group in grouped:
             group = group.reset_index(drop=True)
             traj = []
+            
+            # 预计算所有朝向，然后进行平滑处理
+            headings = []
             for i in range(len(group)):
                 row = group.iloc[i]
                 speed = np.sqrt(row["speed_x"]**2 + row["speed_y"]**2)
-                heading = np.arctan2(row["speed_y"], row["speed_x"]) if speed > 1e-2 else 0.0
+                
+                # 改进的朝向计算
+                if speed > 0.5:  # 提高速度阈值，避免低速时的噪声
+                    heading = np.arctan2(row["speed_y"], row["speed_x"])
+                elif i > 0:
+                    # 低速时使用前一帧的朝向
+                    heading = headings[-1] if headings else 0.0
+                else:
+                    # 第一帧且低速时，尝试使用位置变化计算朝向
+                    if i < len(group) - 1:
+                        next_row = group.iloc[i + 1]
+                        dx = next_row["position_x"] - row["position_x"]
+                        dy = next_row["position_y"] - row["position_y"]
+                        if np.sqrt(dx**2 + dy**2) > 0.1:  # 位置变化足够大
+                            heading = np.arctan2(dy, dx)
+                        else:
+                            heading = 0.0
+                    else:
+                        heading = 0.0
+                        
+                headings.append(heading)
+            
+            # 对朝向进行平滑处理，减少抖动
+            headings = self._smooth_headings(headings)
+            
+            # 构建轨迹点
+            for i in range(len(group)):
+                row = group.iloc[i]
+                speed = np.sqrt(row["speed_x"]**2 + row["speed_y"]**2)
                 traj.append({
                     "x": row["position_x"],
                     "y": row["position_y"],
                     "speed": speed,
-                    "heading": heading
+                    "heading": headings[i]
                 })
             trajectory_dict[int(vid)] = traj
             
         return trajectory_dict
+    
+    def _smooth_headings(self, headings: List[float], window_size: int = 3) -> List[float]:
+        """
+        对朝向序列进行平滑处理，减少抖动
+        
+        Args:
+            headings: 原始朝向序列
+            window_size: 平滑窗口大小
+            
+        Returns:
+            List[float]: 平滑后的朝向序列
+        """
+        if len(headings) <= 1:
+            return headings
+            
+        smoothed = []
+        for i in range(len(headings)):
+            # 确定窗口范围
+            start = max(0, i - window_size // 2)
+            end = min(len(headings), i + window_size // 2 + 1)
+            
+            # 取窗口内的朝向值
+            window_headings = headings[start:end]
+            
+            # 处理角度的连续性问题（-π 到 π 的跳跃）
+            # 将所有角度调整到第一个角度的附近
+            adjusted_headings = [window_headings[0]]
+            for j in range(1, len(window_headings)):
+                prev_heading = adjusted_headings[-1]
+                curr_heading = window_headings[j]
+                
+                # 处理 -π 到 π 的跳跃
+                while curr_heading - prev_heading > np.pi:
+                    curr_heading -= 2 * np.pi
+                while curr_heading - prev_heading < -np.pi:
+                    curr_heading += 2 * np.pi
+                    
+                adjusted_headings.append(curr_heading)
+            
+            # 计算平均值
+            avg_heading = np.mean(adjusted_headings)
+            
+            # 将角度标准化到 [-π, π]
+            while avg_heading > np.pi:
+                avg_heading -= 2 * np.pi
+            while avg_heading < -np.pi:
+                avg_heading += 2 * np.pi
+                
+            smoothed.append(avg_heading)
+            
+        return smoothed
         
     def _print_trajectory_summary(self, trajectory_dict: Dict[int, List[Dict]]):
         """输出轨迹数据统计摘要"""

@@ -223,38 +223,74 @@ class TrajectoryReplayEnv(MetaDriveEnv):
                     "show_line_to_navi_mark": False,  # 不显示导航路线
                     "show_navigation_arrow": False,   # 不显示导航箭头
                     "use_special_color": False,       # 不使用特殊颜色（避免与主车混淆）
-                    # 减少碰撞影响
-                    "mass": 1,                        # 极小质量（降低物理影响）
-                    "no_wheel_friction": True,        # 禁用车轮摩擦
+                    # 优化物理设置，确保严格按轨迹运行
+                    "mass": 0.1,                     # 极小质量（几乎无物理影响）
+                    "no_wheel_friction": True,       # 禁用车轮摩擦
+                    "wheel_friction": 0.0,           # 设置轮胎摩擦为0
+                    "lateral_tire_to_center": 0.0,   # 减少横向力
+                    "longitudinal_tire_to_center": 0.0,  # 减少纵向力
                 })
                 # 初始化创建：在位置(0,0)创建一个背景车辆对象
                 v = self.engine.spawn_object(DefaultVehicle, vehicle_config=vehicle_config, position=[0, 0], heading=0)
 
-                # 配置：尝试禁用物理体（让车辆不参与物理碰撞）
-                if hasattr(v, '_body') and hasattr(v._body, 'disable'):
+                # 强化物理体配置，确保车辆完全按轨迹运行
+                if hasattr(v, '_body'):
                     try:
-                        v._body.disable()  # 禁用物理体，使其不受物理引擎影响
-                    except:
-                        pass
-
-                # 尝试设置为Kinematic模式（不产生物理碰撞，但位置可更新）
-                if hasattr(v, '_body') and hasattr(v._body, 'setKinematic'):
-                    try:
-                        v._body.setKinematic(True)
-                    except:
-                        pass
+                        # 设置为Kinematic模式（完全由脚本控制，不受物理影响）
+                        if hasattr(v._body, 'setKinematic'):
+                            v._body.setKinematic(True)
+                        
+                        # 禁用重力
+                        if hasattr(v._body, 'setGravity'):
+                            v._body.setGravity(0, 0, 0)
+                        
+                        # 禁用碰撞响应
+                        if hasattr(v._body, 'setDeactivationEnabled'):
+                            v._body.setDeactivationEnabled(False)
+                            
+                        # 设置极小质量
+                        if hasattr(v._body, 'setMass'):
+                            v._body.setMass(0.001)
+                            
+                        # 禁用所有力和扭矩
+                        if hasattr(v._body, 'clearForces'):
+                            v._body.clearForces()
+                            
+                    except Exception as e:
+                        # 如果物理设置失败，记录但继续运行
+                        if hasattr(self, '_physics_warning_shown') and not self._physics_warning_shown:
+                            print(f"Warning: Could not fully configure background vehicle physics: {e}")
+                            self._physics_warning_shown = True
 
                 self.ghost_vehicles[vid] = v  # 保存该车辆实例
             else:
                 v = self.ghost_vehicles[vid]  # 已存在则直接取出
 
-            # 车辆定位更新：更新车辆位置和朝向
-            v.set_position([state["x"], state["y"]])
-            v.set_heading_theta(state["heading"])
+            # 车辆状态更新：强制设置位置、朝向和速度，忽略物理引擎
+            try:
+                # 强制设置位置（不受物理约束）
+                v.set_position([state["x"], state["y"]], height=None)
+                
+                # 强制设置朝向（不受物理约束）
+                v.set_heading_theta(state["heading"])
 
-            # 车辆速度更新：根据速度和朝向计算速度向量，并更新车辆速度
-            direction = [np.cos(state["heading"]), np.sin(state["heading"])]
-            v.set_velocity(direction, state["speed"])
+                # 设置速度向量（根据朝向和速度大小）
+                direction = [np.cos(state["heading"]), np.sin(state["heading"])]
+                v.set_velocity(direction, state["speed"])
+                
+                # 强制清除所有物理力，确保车辆严格按轨迹运行
+                if hasattr(v, '_body') and hasattr(v._body, 'clearForces'):
+                    v._body.clearForces()
+                    
+                # 禁用自动控制和物理响应
+                if hasattr(v, 'expert_takeover'):
+                    v.expert_takeover = False
+                if hasattr(v, 'auto_steering'):
+                    v.auto_steering = False
+                    
+            except Exception as e:
+                # 如果设置失败，记录但继续
+                print(f"Warning: Failed to update vehicle {vid} state: {e}")
 
 
     def render(self, *args, **kwargs):
