@@ -52,7 +52,8 @@ class TrajectoryLoader:
                        normalize_position: bool = False, 
                        max_duration: Optional[float] = 100, 
                        use_original_position: bool = False, 
-                       translate_to_origin: bool = True) -> Dict[int, List[Dict]]:
+                       translate_to_origin: bool = True,
+                       target_fps: float = 20.0) -> Dict[int, List[Dict]]:
         """
         加载CSV轨迹数据，并按需进行时间裁剪与位置平移
         
@@ -62,6 +63,7 @@ class TrajectoryLoader:
             max_duration: 仅加载最前面的若干秒数据（默认100秒）
             use_original_position: 是否保留原始坐标（不平移/缩放）
             translate_to_origin: 是否进行平移，使车辆-1位于可驾驶道路的合理起点
+            target_fps: 目标帧率，用于时间插值同步（默认20Hz，即0.05秒步长）
         
         Returns:
             Dict[int, List[Dict]]: 车辆轨迹字典
@@ -250,27 +252,83 @@ class TrajectoryLoader:
                 print(f"  Vehicle {vid}: ({x:.1f}, {y:.1f})")
                 
     def _convert_to_trajectory_dict(self, df: pd.DataFrame) -> Dict[int, List[Dict]]:
-        """将DataFrame转换为轨迹字典格式"""
+        """将DataFrame转换为轨迹字典格式，并进行时间插值同步"""
         grouped = df.groupby("vehicle_id")
         trajectory_dict = {}
 
+        # 分析时间间隔
+        timestamps = df['timestamp'].unique()
+        timestamps = np.sort(timestamps)
+        
+        if len(timestamps) > 1:
+            intervals = np.diff(timestamps)
+            avg_interval = np.mean(intervals)
+            min_interval = np.min(intervals)
+            max_interval = np.max(intervals)
+            
+            if self.verbose:
+                print(f"\nCSV时间戳分析:")
+                print(f"  平均间隔: {avg_interval:.6f} 秒")
+                print(f"  最小间隔: {min_interval:.6f} 秒") 
+                print(f"  最大间隔: {max_interval:.6f} 秒")
+                print(f"  总时长: {timestamps[-1] - timestamps[0]:.3f} 秒")
+        
+        # 使用固定时间步长进行插值（假设MetaDrive默认为20Hz，即0.05秒）
+        target_dt = 1.0 / target_fps  # 使用传入的target_fps
+        start_time = timestamps[0]
+        end_time = timestamps[-1]
+        
+        # 生成统一的时间网格
+        uniform_timestamps = np.arange(start_time, end_time + target_dt, target_dt)
+        
+        if self.verbose:
+            print(f"\n时间插值设置:")
+            print(f"  目标步长: {target_dt:.6f} 秒 ({target_fps:.1f} Hz)")
+            print(f"  插值后帧数: {len(uniform_timestamps)}")
+
         for vid, group in grouped:
             group = group.reset_index(drop=True)
-            traj = []
-            for i in range(len(group)):
-                row = group.iloc[i]
-                speed = np.sqrt(row["speed_x"]**2 + row["speed_y"]**2)
-                # 简化朝向处理：始终朝向x正方向（0度）
-                heading = 0.0
-                traj.append({
-                    "x": row["position_x"],
-                    "y": row["position_y"],
-                    "speed": speed,
-                    "heading": heading
-                })
-            trajectory_dict[int(vid)] = traj
+            
+            # 对每个车辆进行时间插值
+            interpolated_traj = self._interpolate_vehicle_trajectory(group, uniform_timestamps)
+            trajectory_dict[int(vid)] = interpolated_traj
             
         return trajectory_dict
+    
+    def _interpolate_vehicle_trajectory(self, vehicle_df: pd.DataFrame, target_timestamps: np.ndarray) -> List[Dict]:
+        """
+        对单个车辆的轨迹进行时间插值
+        
+        Args:
+            vehicle_df: 单个车辆的数据
+            target_timestamps: 目标时间戳数组
+            
+        Returns:
+            List[Dict]: 插值后的轨迹点列表
+        """
+        original_timestamps = vehicle_df['timestamp'].values
+        
+        # 使用线性插值
+        interp_x = np.interp(target_timestamps, original_timestamps, vehicle_df['position_x'].values)
+        interp_y = np.interp(target_timestamps, original_timestamps, vehicle_df['position_y'].values)
+        interp_speed_x = np.interp(target_timestamps, original_timestamps, vehicle_df['speed_x'].values)
+        interp_speed_y = np.interp(target_timestamps, original_timestamps, vehicle_df['speed_y'].values)
+        
+        interpolated_traj = []
+        for i in range(len(target_timestamps)):
+            speed = np.sqrt(interp_speed_x[i]**2 + interp_speed_y[i]**2)
+            # 简化朝向处理：始终朝向x正方向（0度）
+            heading = 0.0
+            
+            interpolated_traj.append({
+                "x": interp_x[i],
+                "y": interp_y[i],
+                "speed": speed,
+                "heading": heading,
+                "timestamp": target_timestamps[i]  # 添加时间戳信息
+            })
+            
+        return interpolated_traj
         
     def _print_trajectory_summary(self, trajectory_dict: Dict[int, List[Dict]]):
         """输出轨迹数据统计摘要"""
@@ -346,7 +404,8 @@ def load_trajectory(csv_path: str,
                    normalize_position: bool = False, 
                    max_duration: Optional[float] = 100, 
                    use_original_position: bool = False, 
-                   translate_to_origin: bool = True) -> Dict[int, List[Dict]]:
+                   translate_to_origin: bool = True,
+                   target_fps: float = 20.0) -> Dict[int, List[Dict]]:
     """
     便捷的轨迹加载函数（保持向后兼容性）
     
@@ -358,7 +417,8 @@ def load_trajectory(csv_path: str,
         normalize_position=normalize_position,
         max_duration=max_duration,
         use_original_position=use_original_position,
-        translate_to_origin=translate_to_origin
+        translate_to_origin=translate_to_origin,
+        target_fps=target_fps
     )
 
 

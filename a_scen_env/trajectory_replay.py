@@ -90,6 +90,13 @@ class TrajectoryReplayEnv(MetaDriveEnv):
         
         super().__init__(default_config)
         
+        # 获取仿真时间步长
+        self.physics_world_step_size = self.engine.physics_world.static_world.getPhysicsWorldStepSize()
+        print(f"MetaDrive physics step size: {self.physics_world_step_size:.6f} seconds")
+        
+        # 检查轨迹数据的时间步长并设置同步
+        self._setup_time_synchronization()
+        
         # 初始化控制模式管理器
         self.control_manager = ControlModeManager(
             engine=self.engine,
@@ -306,6 +313,45 @@ class TrajectoryReplayEnv(MetaDriveEnv):
         print("=" * 50)
 
 
+    def _setup_time_synchronization(self):
+        """
+        设置时间同步，分析轨迹数据的时间特性
+        """
+        if not self.main_vehicle_trajectory:
+            print("Warning: No main vehicle trajectory for time synchronization")
+            return
+            
+        # 检查轨迹数据是否包含时间戳信息
+        if len(self.main_vehicle_trajectory) > 1:
+            first_point = self.main_vehicle_trajectory[0]
+            second_point = self.main_vehicle_trajectory[1]
+            
+            if "timestamp" in first_point and "timestamp" in second_point:
+                csv_dt = second_point["timestamp"] - first_point["timestamp"]
+                print(f"\nTime Synchronization Analysis:")
+                print(f"  CSV interpolated step size: {csv_dt:.6f} seconds ({1/csv_dt:.1f} Hz)")
+                print(f"  MetaDrive physics step: {self.physics_world_step_size:.6f} seconds ({1/self.physics_world_step_size:.1f} Hz)")
+                
+                # 计算时间步长比率
+                step_ratio = csv_dt / self.physics_world_step_size
+                print(f"  Time step ratio (CSV/Physics): {step_ratio:.2f}")
+                
+                if abs(step_ratio - 1.0) > 0.1:  # 如果差异超过10%
+                    print(f"  ⚠️  Warning: Significant time step mismatch!")
+                    print(f"     This may cause speed inconsistencies.")
+                    print(f"     Consider adjusting CSV interpolation or physics step size.")
+                else:
+                    print(f"  ✅ Time steps are well synchronized")
+                    
+                self.csv_dt = csv_dt
+            else:
+                print("Warning: Trajectory data missing timestamp information")
+                self.csv_dt = 0.05  # 默认50ms
+        else:
+            print("Warning: Insufficient trajectory data for time analysis")
+            self.csv_dt = 0.05
+
+
     def render(self, *args, **kwargs):
         """
         渲染环境并在HUD上显示当前控制模式、步骤计数、主车状态与背景车数量等信息。
@@ -335,7 +381,8 @@ if __name__ == "__main__":
         normalize_position=False,  # 不归一化
         max_duration=100,  # 只加载前100秒
         use_original_position=False,  # 不使用原始位置
-        translate_to_origin=True  # 平移到道路起点
+        translate_to_origin=True,  # 平移到道路起点
+        target_fps=50.0  # 使用50Hz匹配MetaDrive物理更新频率
     )
     
     print(f"\nLoaded {len(traj_data)} vehicles from CSV")
