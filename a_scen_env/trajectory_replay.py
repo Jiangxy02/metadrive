@@ -249,11 +249,13 @@ class TrajectoryReplayEnv(MetaDriveEnv):
             else:
                 v = self.ghost_vehicles[vid]  # 已存在则直接取出
 
-            # 车辆定位更新：只更新车辆位置，朝向保持x正方向
+            # 车辆定位更新：更新位置、朝向和速度
             v.set_position([state["x"], state["y"]])
             # 朝向始终保持x正方向（0度），避免旋转导致的视觉问题
             v.set_heading_theta(0.0)
-            # 不设置速度，让背景车保持静态外观（只改变位置）
+            # 设置速度大小（用于显示和诊断），但方向始终向前
+            direction = [1.0, 0.0]  # x正方向
+            v.set_velocity(direction, state["speed"])  # 设置速度大小，方向固定
 
 
     def render(self, *args, **kwargs):
@@ -265,6 +267,9 @@ class TrajectoryReplayEnv(MetaDriveEnv):
         # 从控制管理器获取状态信息
         control_status = self.control_manager.get_control_status()
         
+        # 获取速度诊断信息
+        speed_diagnostics = self._get_speed_diagnostics()
+        
         render_text.update(control_status)
         render_text.update({
             "Step": f"{self._step_count}/{self.max_step}",
@@ -272,8 +277,152 @@ class TrajectoryReplayEnv(MetaDriveEnv):
             "Main Car Speed": f"{self.agent.speed:.1f} m/s",
             "Background Vehicles": len(self.ghost_vehicles),
         })
+        
+        # 添加速度诊断信息到显示
+        render_text.update(speed_diagnostics)
+        
         kwargs["text"] = render_text
         return super().render(*args, **kwargs)
+    
+    def _get_speed_diagnostics(self) -> dict:
+        """
+        获取速度诊断信息，比较主车与背景车的速度关系
+        """
+        diagnostics = {}
+        
+        if not hasattr(self, '_speed_history'):
+            self._speed_history = []
+            
+        # 获取主车信息
+        main_car_speed = self.agent.speed
+        main_car_pos = self.agent.position
+        
+        # 获取主车轨迹中的预期速度（如果存在）
+        main_car_expected_speed = None
+        if self.main_vehicle_trajectory and self._step_count < len(self.main_vehicle_trajectory):
+            main_car_expected_speed = self.main_vehicle_trajectory[self._step_count]["speed"]
+        
+        # 获取背景车当前速度信息
+        bg_speeds = []
+        bg_expected_speeds = []
+        bg_positions = []
+        
+        for vid, traj in self.trajectory_dict.items():
+            if vid in self.ghost_vehicles and self._step_count < len(traj):
+                bg_vehicle = self.ghost_vehicles[vid]
+                current_speed = bg_vehicle.speed if hasattr(bg_vehicle, 'speed') else 0.0
+                expected_speed = traj[self._step_count]["speed"]
+                position = bg_vehicle.position if hasattr(bg_vehicle, 'position') else [0, 0]
+                
+                bg_speeds.append(current_speed)
+                bg_expected_speeds.append(expected_speed)
+                bg_positions.append(position)
+        
+        # 计算速度统计
+        if bg_speeds:
+            avg_bg_speed = sum(bg_speeds) / len(bg_speeds)
+            max_bg_speed = max(bg_speeds)
+            min_bg_speed = min(bg_speeds)
+        else:
+            avg_bg_speed = max_bg_speed = min_bg_speed = 0.0
+            
+        if bg_expected_speeds:
+            avg_expected_bg_speed = sum(bg_expected_speeds) / len(bg_expected_speeds)
+        else:
+            avg_expected_bg_speed = 0.0
+        
+        # 记录速度历史（每10步记录一次，避免数据过多）
+        if self._step_count % 10 == 0:
+            speed_record = {
+                'step': self._step_count,
+                'main_actual': main_car_speed,
+                'main_expected': main_car_expected_speed,
+                'bg_actual_avg': avg_bg_speed,
+                'bg_expected_avg': avg_expected_bg_speed
+            }
+            self._speed_history.append(speed_record)
+            
+            # 只保留最近50条记录
+            if len(self._speed_history) > 50:
+                self._speed_history.pop(0)
+        
+        # 速度匹配分析
+        speed_match_status = "Good"
+        if main_car_expected_speed is not None:
+            main_speed_error = abs(main_car_speed - main_car_expected_speed)
+            if main_speed_error > 5.0:  # 速度差异超过5m/s
+                speed_match_status = f"Main car speed mismatch: {main_speed_error:.1f}m/s"
+        
+        if avg_expected_bg_speed > 0:
+            bg_speed_error = abs(avg_bg_speed - avg_expected_bg_speed)
+            if bg_speed_error > 3.0:  # 背景车速度差异超过3m/s
+                if speed_match_status == "Good":
+                    speed_match_status = f"BG speed mismatch: {bg_speed_error:.1f}m/s"
+                else:
+                    speed_match_status += f", BG: {bg_speed_error:.1f}m/s"
+        
+        # 更新诊断信息
+        diagnostics.update({
+            "=== SPEED DIAGNOSTICS ===": "",
+            "Main Speed (Actual)": f"{main_car_speed:.1f} m/s",
+            "Main Speed (Expected)": f"{main_car_expected_speed:.1f} m/s" if main_car_expected_speed else "N/A",
+            "BG Speed (Avg Actual)": f"{avg_bg_speed:.1f} m/s",
+            "BG Speed (Avg Expected)": f"{avg_expected_bg_speed:.1f} m/s",
+            "Speed Match Status": speed_match_status,
+        })
+        
+        # 每50步输出详细的速度分析
+        if self._step_count % 50 == 0 and self._step_count > 0:
+            self._print_detailed_speed_analysis()
+        
+        return diagnostics
+    
+    def _print_detailed_speed_analysis(self):
+        """
+        打印详细的速度分析报告
+        """
+        print(f"\n=== SPEED ANALYSIS (Step {self._step_count}) ===")
+        
+        # 主车速度分析
+        if self.main_vehicle_trajectory and self._step_count < len(self.main_vehicle_trajectory):
+            expected_speed = self.main_vehicle_trajectory[self._step_count]["speed"]
+            actual_speed = self.agent.speed
+            speed_error = abs(actual_speed - expected_speed)
+            print(f"Main Car:")
+            print(f"  Expected Speed: {expected_speed:.2f} m/s")
+            print(f"  Actual Speed:   {actual_speed:.2f} m/s")
+            print(f"  Speed Error:    {speed_error:.2f} m/s")
+            print(f"  Error %:        {(speed_error/expected_speed*100) if expected_speed > 0 else 0:.1f}%")
+        
+        # 背景车速度分析
+        print(f"\nBackground Vehicles ({len(self.ghost_vehicles)} active):")
+        total_error = 0
+        vehicle_count = 0
+        
+        for vid, traj in self.trajectory_dict.items():
+            if vid in self.ghost_vehicles and self._step_count < len(traj):
+                bg_vehicle = self.ghost_vehicles[vid]
+                expected_speed = traj[self._step_count]["speed"]
+                actual_speed = bg_vehicle.speed if hasattr(bg_vehicle, 'speed') else 0.0
+                speed_error = abs(actual_speed - expected_speed)
+                total_error += speed_error
+                vehicle_count += 1
+                
+                print(f"  Vehicle {vid}: Expected={expected_speed:.1f}, Actual={actual_speed:.1f}, Error={speed_error:.1f} m/s")
+        
+        if vehicle_count > 0:
+            avg_error = total_error / vehicle_count
+            print(f"  Average Error: {avg_error:.2f} m/s")
+        
+        # 速度历史趋势
+        if len(self._speed_history) >= 3:
+            recent_records = self._speed_history[-3:]
+            print(f"\nSpeed Trend (last 3 records):")
+            for record in recent_records:
+                print(f"  Step {record['step']}: Main={record['main_actual']:.1f} (exp:{record['main_expected']:.1f}), " +
+                      f"BG={record['bg_actual_avg']:.1f} (exp:{record['bg_expected_avg']:.1f})")
+        
+        print("=" * 50)
 
 
 if __name__ == "__main__":
