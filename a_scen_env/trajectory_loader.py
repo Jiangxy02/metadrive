@@ -92,7 +92,7 @@ class TrajectoryLoader:
             df = self._apply_normalization_transform(df)
             
         # 第四步：转换为轨迹字典格式
-        trajectory_dict = self._convert_to_trajectory_dict(df)
+        trajectory_dict = self._convert_to_trajectory_dict(df, target_fps)
         
         # 第五步：输出统计信息
         self._print_trajectory_summary(trajectory_dict)
@@ -251,7 +251,7 @@ class TrajectoryLoader:
                 x, y = initial_positions.loc[vid]
                 print(f"  Vehicle {vid}: ({x:.1f}, {y:.1f})")
                 
-    def _convert_to_trajectory_dict(self, df: pd.DataFrame) -> Dict[int, List[Dict]]:
+    def _convert_to_trajectory_dict(self, df: pd.DataFrame, target_fps: float) -> Dict[int, List[Dict]]:
         """将DataFrame转换为轨迹字典格式，并进行时间插值同步"""
         grouped = df.groupby("vehicle_id")
         trajectory_dict = {}
