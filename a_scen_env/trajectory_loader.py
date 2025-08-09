@@ -97,6 +97,9 @@ class TrajectoryLoader:
         # 第五步：输出统计信息
         self._print_trajectory_summary(trajectory_dict)
         
+        # 第六步：分析采样质量
+        self._analyze_sampling_quality(trajectory_dict)
+        
         return trajectory_dict
         
     def _load_csv_data(self, csv_path: str) -> pd.DataFrame:
@@ -252,7 +255,7 @@ class TrajectoryLoader:
                 print(f"  Vehicle {vid}: ({x:.1f}, {y:.1f})")
                 
     def _convert_to_trajectory_dict(self, df: pd.DataFrame, target_fps: float) -> Dict[int, List[Dict]]:
-        """将DataFrame转换为轨迹字典格式，并进行时间插值同步"""
+        """将DataFrame转换为轨迹字典格式，使用时间采样而非插值"""
         grouped = df.groupby("vehicle_id")
         trajectory_dict = {}
 
@@ -272,63 +275,66 @@ class TrajectoryLoader:
                 print(f"  最小间隔: {min_interval:.6f} 秒") 
                 print(f"  最大间隔: {max_interval:.6f} 秒")
                 print(f"  总时长: {timestamps[-1] - timestamps[0]:.3f} 秒")
+                print(f"  总数据点: {len(timestamps)}")
         
-        # 使用固定时间步长进行插值（假设MetaDrive默认为20Hz，即0.05秒）
-        target_dt = 1.0 / target_fps  # 使用传入的target_fps
+        # 使用时间采样而非插值
+        target_dt = 1.0 / target_fps  # 目标时间步长
         start_time = timestamps[0]
         end_time = timestamps[-1]
         
-        # 生成统一的时间网格
-        uniform_timestamps = np.arange(start_time, end_time + target_dt, target_dt)
+        # 生成采样时间点
+        sample_times = np.arange(start_time, end_time + target_dt, target_dt)
         
         if self.verbose:
-            print(f"\n时间插值设置:")
+            print(f"\n时间采样设置:")
             print(f"  目标步长: {target_dt:.6f} 秒 ({target_fps:.1f} Hz)")
-            print(f"  插值后帧数: {len(uniform_timestamps)}")
+            print(f"  采样后帧数: {len(sample_times)}")
+            print(f"  原始帧数: {len(timestamps)}")
+            print(f"  采样策略: 选择最接近的真实数据点")
 
         for vid, group in grouped:
             group = group.reset_index(drop=True)
             
-            # 对每个车辆进行时间插值
-            interpolated_traj = self._interpolate_vehicle_trajectory(group, uniform_timestamps)
-            trajectory_dict[int(vid)] = interpolated_traj
+            # 对每个车辆进行时间采样
+            sampled_traj = self._sample_vehicle_trajectory(group, sample_times)
+            trajectory_dict[int(vid)] = sampled_traj
             
         return trajectory_dict
     
-    def _interpolate_vehicle_trajectory(self, vehicle_df: pd.DataFrame, target_timestamps: np.ndarray) -> List[Dict]:
+    def _sample_vehicle_trajectory(self, vehicle_df: pd.DataFrame, sample_times: np.ndarray) -> List[Dict]:
         """
-        对单个车辆的轨迹进行时间插值
+        对单个车辆的轨迹进行时间采样，选择最接近的真实数据点
         
         Args:
             vehicle_df: 单个车辆的数据
-            target_timestamps: 目标时间戳数组
+            sample_times: 采样时间点数组
             
         Returns:
-            List[Dict]: 插值后的轨迹点列表
+            List[Dict]: 采样后的轨迹点列表
         """
         original_timestamps = vehicle_df['timestamp'].values
         
-        # 使用线性插值
-        interp_x = np.interp(target_timestamps, original_timestamps, vehicle_df['position_x'].values)
-        interp_y = np.interp(target_timestamps, original_timestamps, vehicle_df['position_y'].values)
-        interp_speed_x = np.interp(target_timestamps, original_timestamps, vehicle_df['speed_x'].values)
-        interp_speed_y = np.interp(target_timestamps, original_timestamps, vehicle_df['speed_y'].values)
-        
-        interpolated_traj = []
-        for i in range(len(target_timestamps)):
-            speed = np.sqrt(interp_speed_x[i]**2 + interp_speed_y[i]**2)
+        sampled_traj = []
+        for target_time in sample_times:
+            # 找到最接近的时间戳索引
+            closest_idx = np.argmin(np.abs(original_timestamps - target_time))
+            row = vehicle_df.iloc[closest_idx]
+            
+            speed = np.sqrt(row["speed_x"]**2 + row["speed_y"]**2)
             # 简化朝向处理：始终朝向x正方向（0度）
             heading = 0.0
             
-            interpolated_traj.append({
-                "x": interp_x[i],
-                "y": interp_y[i],
+            sampled_traj.append({
+                "x": row["position_x"],
+                "y": row["position_y"],
                 "speed": speed,
                 "heading": heading,
-                "timestamp": target_timestamps[i]  # 添加时间戳信息
+                "timestamp": target_time,  # 使用目标时间，便于同步
+                "original_timestamp": row["timestamp"],  # 保留原始时间戳
+                "time_error": abs(row["timestamp"] - target_time)  # 记录时间误差
             })
             
-        return interpolated_traj
+        return sampled_traj
         
     def _print_trajectory_summary(self, trajectory_dict: Dict[int, List[Dict]]):
         """输出轨迹数据统计摘要"""
@@ -338,6 +344,30 @@ class TrajectoryLoader:
         print(f"\nLoaded trajectories for {len(trajectory_dict)} vehicles")
         print(f"Trajectory lengths: {[len(traj) for traj in trajectory_dict.values()]}")
         
+    def _analyze_sampling_quality(self, trajectory_dict: Dict[int, List[Dict]]):
+        """分析采样质量，显示时间误差统计"""
+        if not self.verbose:
+            return
+            
+        all_time_errors = []
+        for vid, traj in trajectory_dict.items():
+            for point in traj:
+                all_time_errors.append(point["time_error"])
+                
+        if all_time_errors:
+            avg_time_error = np.mean(all_time_errors)
+            max_time_error = np.max(all_time_errors)
+            min_time_error = np.min(all_time_errors)
+            
+            print(f"\n采样质量分析:")
+            print(f"  平均时间误差: {avg_time_error:.6f} 秒")
+            print(f"  最大时间误差: {max_time_error:.6f} 秒")
+            print(f"  最小时间误差: {min_time_error:.6f} 秒")
+            print(f"  总采样点数: {sum(len(traj) for traj in trajectory_dict.values())}")
+            print(f"  总时间误差点数: {len(all_time_errors)}")
+        else:
+            print(f"\n采样质量分析: 没有时间误差数据")
+            
     def get_vehicle_info(self, trajectory_dict: Dict[int, List[Dict]]) -> Dict:
         """
         获取轨迹数据的统计信息
