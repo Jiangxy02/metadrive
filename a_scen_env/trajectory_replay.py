@@ -113,6 +113,99 @@ class TrajectoryReplayEnv(MetaDriveEnv):
         
         # 重写 max_step 以允许比轨迹更长的驾驶时间
         self.max_step = 10000  # 允许 10000 步，无论轨迹长度如何
+        
+        # 分析坐标系统和速度单位
+        self._analyze_coordinate_system()
+
+    def _analyze_coordinate_system(self):
+        """
+        分析坐标系统和速度单位，检查是否需要单位转换
+        """
+        print(f"\n{'='*60}")
+        print(f"坐标系统和单位分析")
+        print(f"{'='*60}")
+        
+        if self.main_vehicle_trajectory and len(self.main_vehicle_trajectory) > 5:
+            # 分析主车轨迹的前几个点
+            print(f"主车轨迹分析 (前5个点):")
+            for i in range(min(5, len(self.main_vehicle_trajectory))):
+                point = self.main_vehicle_trajectory[i]
+                print(f"  Point {i}: pos=({point['x']:.2f}, {point['y']:.2f}), speed={point['speed']:.2f} m/s")
+                if 'original_timestamp' in point:
+                    print(f"           timestamp={point['original_timestamp']:.6f}")
+            
+            # 计算位置变化速度
+            if len(self.main_vehicle_trajectory) > 1:
+                print(f"\n位置变化分析:")
+                for i in range(1, min(4, len(self.main_vehicle_trajectory))):
+                    p1 = self.main_vehicle_trajectory[i-1]
+                    p2 = self.main_vehicle_trajectory[i]
+                    
+                    # 计算距离
+                    dx = p2['x'] - p1['x']
+                    dy = p2['y'] - p1['y']
+                    distance = (dx**2 + dy**2)**0.5
+                    
+                    # 计算时间间隔
+                    if 'original_timestamp' in p1 and 'original_timestamp' in p2:
+                        dt = p2['original_timestamp'] - p1['original_timestamp']
+                        calculated_speed = distance / dt if dt > 0 else 0
+                        
+                        print(f"  步骤 {i-1}->{i}:")
+                        print(f"    位置变化: Δx={dx:.2f}, Δy={dy:.2f}, 距离={distance:.2f}")
+                        print(f"    时间间隔: Δt={dt:.6f}s")
+                        print(f"    计算速度: {calculated_speed:.2f} m/s")
+                        print(f"    记录速度: {p2['speed']:.2f} m/s")
+                        print(f"    速度比率: {calculated_speed/p2['speed']:.3f}" if p2['speed'] > 0 else "    速度比率: N/A (零速度)")
+                        
+                        # 检查单位是否一致
+                        if abs(calculated_speed - p2['speed']) > 1.0:  # 差异超过1m/s
+                            print(f"    ⚠️  警告: 位置变化速度与记录速度差异较大!")
+                        else:
+                            print(f"    ✅ 速度数据一致")
+                    else:
+                        print(f"  步骤 {i-1}->{i}: 缺少时间戳信息")
+        
+        # 分析坐标范围
+        if self.trajectory_dict:
+            all_x = []
+            all_y = []
+            all_speeds = []
+            
+            for vid, traj in self.trajectory_dict.items():
+                for point in traj:
+                    all_x.append(point['x'])
+                    all_y.append(point['y'])
+                    all_speeds.append(point['speed'])
+            
+            if self.main_vehicle_trajectory:
+                for point in self.main_vehicle_trajectory:
+                    all_x.append(point['x'])
+                    all_y.append(point['y'])
+                    all_speeds.append(point['speed'])
+            
+            print(f"\n数据范围分析:")
+            print(f"  X坐标范围: [{min(all_x):.2f}, {max(all_x):.2f}] (范围: {max(all_x)-min(all_x):.2f})")
+            print(f"  Y坐标范围: [{min(all_y):.2f}, {max(all_y):.2f}] (范围: {max(all_y)-min(all_y):.2f})")
+            print(f"  速度范围: [{min(all_speeds):.2f}, {max(all_speeds):.2f}] m/s")
+            
+            # 判断可能的坐标系统
+            x_range = max(all_x) - min(all_x)
+            y_range = max(all_y) - min(all_y)
+            
+            print(f"\n坐标系统推测:")
+            if x_range > 1000 or y_range > 1000:
+                print(f"  可能使用UTM或大地坐标系统 (范围>1000)")
+                print(f"  建议: 可能需要坐标变换到MetaDrive本地坐标系")
+            else:
+                print(f"  可能已经是本地坐标系统 (范围<1000)")
+            
+            if max(all_speeds) > 50:
+                print(f"  ⚠️  速度数据可能需要单位转换 (最大速度>{max(all_speeds):.1f} m/s)")
+            else:
+                print(f"  ✅ 速度数据在合理范围内")
+        
+        print(f"{'='*60}")
 
     def reset(self):
         """
@@ -188,6 +281,10 @@ class TrajectoryReplayEnv(MetaDriveEnv):
         # 每10步输出速度对比信息，检查同步效果
         if self._step_count % 10 == 0:
             self._print_speed_comparison()
+            
+        # 每50步输出MetaDrive和CSV数据的单位对比
+        if self._step_count % 50 == 0:
+            self._print_metadrive_vs_csv_comparison()
         
         # 根据实例属性决定是否结束（不依赖父类config中的未知键）
         crash_flag = info.get("crash", False) or info.get("crash_vehicle", False) or info.get("crash_object", False) or info.get("crash_building", False)
@@ -316,6 +413,71 @@ class TrajectoryReplayEnv(MetaDriveEnv):
                     print(f"  Vehicle {vid}: Actual={actual_speed:.1f} m/s, Expected={expected_speed:.1f} m/s, Pos=({position[0]:.1f}, {position[1]:.1f})")
         
         print("=" * 50)
+
+
+    def _print_metadrive_vs_csv_comparison(self):
+        """
+        对比MetaDrive和CSV数据的单位和数值，检查是否一致
+        """
+        print(f"\n{'='*50}")
+        print(f"MetaDrive vs CSV 数据对比 (Step {self._step_count})")
+        print(f"{'='*50}")
+        
+        # 获取主车当前状态
+        main_car_pos = self.agent.position
+        main_car_speed = self.agent.speed
+        main_car_heading = self.agent.heading_theta
+        
+        print(f"主车对比:")
+        print(f"  MetaDrive - 位置: ({main_car_pos[0]:.2f}, {main_car_pos[1]:.2f})")
+        print(f"  MetaDrive - 速度: {main_car_speed:.2f} m/s")
+        print(f"  MetaDrive - 朝向: {main_car_heading:.3f} rad")
+        
+        # 获取CSV中对应的主车状态
+        if self.main_vehicle_trajectory and self._step_count < len(self.main_vehicle_trajectory):
+            csv_state = self.main_vehicle_trajectory[self._step_count]
+            print(f"  CSV数据 - 位置: ({csv_state['x']:.2f}, {csv_state['y']:.2f})")
+            print(f"  CSV数据 - 速度: {csv_state['speed']:.2f} m/s")
+            print(f"  CSV数据 - 朝向: {csv_state['heading']:.3f} rad")
+            
+            # 计算差异
+            pos_diff = ((main_car_pos[0] - csv_state['x'])**2 + (main_car_pos[1] - csv_state['y'])**2)**0.5
+            speed_diff = abs(main_car_speed - csv_state['speed'])
+            
+            print(f"  差异分析:")
+            print(f"    位置差异: {pos_diff:.2f} 单位")
+            print(f"    速度差异: {speed_diff:.2f} m/s")
+            print(f"    速度比率: {main_car_speed/csv_state['speed']:.3f}" if csv_state['speed'] > 0 else "    速度比率: N/A")
+            
+            # 判断单位是否匹配
+            if pos_diff > 10:
+                print(f"    ⚠️  位置差异较大，可能存在坐标系统或单位问题")
+            if speed_diff > 5:
+                print(f"    ⚠️  速度差异较大，可能存在单位或控制问题")
+            if abs(main_car_speed/csv_state['speed'] - 1.0) > 0.2 and csv_state['speed'] > 0:
+                print(f"    ⚠️  速度比率偏离1.0较多，检查单位转换")
+        
+        # 检查背景车
+        print(f"\n背景车采样检查:")
+        sample_count = 0
+        for vid, traj in self.trajectory_dict.items():
+            if vid in self.ghost_vehicles and self._step_count < len(traj) and sample_count < 3:
+                csv_state = traj[self._step_count]
+                bg_vehicle = self.ghost_vehicles[vid]
+                
+                if hasattr(bg_vehicle, 'position') and hasattr(bg_vehicle, 'speed'):
+                    bg_pos = bg_vehicle.position
+                    bg_speed = bg_vehicle.speed
+                    
+                    pos_diff = ((bg_pos[0] - csv_state['x'])**2 + (bg_pos[1] - csv_state['y'])**2)**0.5
+                    speed_diff = abs(bg_speed - csv_state['speed'])
+                    
+                    print(f"  Vehicle {vid}:")
+                    print(f"    位置差异: {pos_diff:.2f}, 速度差异: {speed_diff:.2f} m/s")
+                    
+                sample_count += 1
+        
+        print(f"{'='*50}")
 
 
     def _setup_time_synchronization(self):
