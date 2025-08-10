@@ -85,17 +85,6 @@ class TrajectoryReplayEnv(MetaDriveEnv):
         self.end_on_arrive_dest = user_config.pop("end_on_arrive_dest", False)  # 当车辆到达目的地时是否立即结束
         self.end_on_horizon = user_config.pop("end_on_horizon", False)  # 当到达最大时间步（horizon）时是否结束
 
-        # ===== 新增：背景车更新机制控制参数 =====
-        self.background_vehicle_update_mode = user_config.pop("background_vehicle_update_mode", "position")
-        # 可选值：
-        # - "position": 使用CSV位置数据直接更新（原kinematic模式）
-        # - "dynamics": 使用CSV中的speed_x, speed_y通过动力学模型更新（物理模式）
-        
-        print(f"Background vehicle update mode: {self.background_vehicle_update_mode}")
-        if self.background_vehicle_update_mode not in ["position", "dynamics"]:
-            print(f"Warning: Unknown background_vehicle_update_mode '{self.background_vehicle_update_mode}', defaulting to 'position'")
-            self.background_vehicle_update_mode = "position"
-
         if user_config:
             default_config.update(user_config)
         
@@ -236,11 +225,8 @@ class TrajectoryReplayEnv(MetaDriveEnv):
     def _replay_all_vehicles(self):
         """
         重放所有背景车辆：
-        - 支持两种更新模式：
-          1) position模式：按时间步取每辆车当前状态，创建/更新 `DefaultVehicle` 实例，
-             直接设置位置（kinematic模式）
-          2) dynamics模式：使用CSV中的speed_x, speed_y通过物理引擎更新车辆，
-             更真实地模拟车辆运动
+        - 按时间步取每辆车当前状态，创建/更新 `DefaultVehicle` 实例；
+        - 尽可能降低其物理影响（质量、摩擦、设置为Kinematic等），仅用于可视化与相对关系展示；
         - 当轨迹结束时，当前实现选择"保持最后位置不移除"（可按需改为销毁）。
         """
         for vid, traj in self.trajectory_dict.items():  # 遍历每辆车的轨迹数据
@@ -270,107 +256,38 @@ class TrajectoryReplayEnv(MetaDriveEnv):
                     "show_line_to_navi_mark": False,  # 不显示导航路线
                     "show_navigation_arrow": False,   # 不显示导航箭头
                     "use_special_color": False,       # 不使用特殊颜色（避免与主车混淆）
+                    # 减少碰撞影响
+                    "mass": 1,                        # 极小质量（降低物理影响）
+                    "no_wheel_friction": True,        # 禁用车轮摩擦
                 })
-                
-                # 根据更新模式配置车辆物理属性
-                if self.background_vehicle_update_mode == "position":
-                    # position模式：使用kinematic模式，减少物理影响
-                    vehicle_config.update({
-                        "mass": 1,                        # 极小质量（降低物理影响）
-                        "no_wheel_friction": True,        # 禁用车轮摩擦
-                    })
-                elif self.background_vehicle_update_mode == "dynamics":
-                    # dynamics模式：使用正常物理参数，让车辆参与物理模拟
-                    vehicle_config.update({
-                        "mass": 1100,                     # 正常质量
-                        "no_wheel_friction": False,       # 启用车轮摩擦
-                    })
-                
                 # 初始化创建：在位置(0,0)创建一个背景车辆对象
                 v = self.engine.spawn_object(DefaultVehicle, vehicle_config=vehicle_config, position=[0, 0], heading=0)
 
-                # 根据更新模式配置物理属性
-                if self.background_vehicle_update_mode == "position":
-                    # position模式：配置为kinematic模式
-                    if hasattr(v, '_body') and hasattr(v._body, 'disable'):
-                        try:
-                            v._body.disable()  # 禁用物理体，使其不受物理引擎影响
-                        except:
-                            pass
+                # 配置：尝试禁用物理体（让车辆不参与物理碰撞）
+                if hasattr(v, '_body') and hasattr(v._body, 'disable'):
+                    try:
+                        v._body.disable()  # 禁用物理体，使其不受物理引擎影响
+                    except:
+                        pass
 
-                    # 尝试设置为Kinematic模式（不产生物理碰撞，但位置可更新）
-                    if hasattr(v, '_body') and hasattr(v._body, 'setKinematic'):
-                        try:
-                            v._body.setKinematic(True)
-                        except:
-                            pass
-                elif self.background_vehicle_update_mode == "dynamics":
-                    # dynamics模式：保持正常物理模式（非kinematic）
-                    if hasattr(v, '_body') and hasattr(v._body, 'setKinematic'):
-                        try:
-                            v._body.setKinematic(False)  # 确保不是kinematic模式
-                        except:
-                            pass
+                # 尝试设置为Kinematic模式（不产生物理碰撞，但位置可更新）
+                if hasattr(v, '_body') and hasattr(v._body, 'setKinematic'):
+                    try:
+                        v._body.setKinematic(True)
+                    except:
+                        pass
 
                 self.ghost_vehicles[vid] = v  # 保存该车辆实例
             else:
                 v = self.ghost_vehicles[vid]  # 已存在则直接取出
 
-            # 根据更新模式选择不同的车辆更新方式
-            if self.background_vehicle_update_mode == "position":
-                self._update_vehicle_by_position(v, state)
-            elif self.background_vehicle_update_mode == "dynamics":
-                self._update_vehicle_by_dynamics(v, state, vid)
-
-    def _update_vehicle_by_position(self, vehicle, state):
-        """
-        位置模式：直接更新车辆位置（原kinematic模式）
-        """
-        # 车辆定位更新：只更新车辆位置，朝向保持x正方向
-        vehicle.set_position([state["x"], state["y"]])
-        # 朝向始终保持x正方向（0度），避免旋转导致的视觉问题
-        vehicle.set_heading_theta(0.0)
-        # 设置速度大小（用于显示和诊断），但方向始终向前
-        direction = [1.0, 0.0]  # x正方向
-        vehicle.set_velocity(direction, state["speed"])  # 设置速度大小，方向固定
-
-    def _update_vehicle_by_dynamics(self, vehicle, state, vehicle_id):
-        """
-        动力学模式：使用CSV中的speed_x, speed_y通过物理引擎更新车辆
-        """
-        # 获取CSV中的速度分量
-        speed_x = state.get("speed_x", 0.0)
-        speed_y = state.get("speed_y", 0.0)
-        
-        # 计算朝向（基于速度方向）
-        if abs(speed_x) > 0.01 or abs(speed_y) > 0.01:  # 避免除零错误
-            heading = np.arctan2(speed_y, speed_x)
-        else:
-            heading = 0.0  # 静止时保持x正方向
-        
-        # 设置车辆朝向
-        vehicle.set_heading_theta(heading)
-        
-        # 设置速度向量（使用原始的speed_x, speed_y）
-        speed_magnitude = np.sqrt(speed_x**2 + speed_y**2)
-        if speed_magnitude > 0.01:
-            # 归一化方向向量
-            direction = [speed_x / speed_magnitude, speed_y / speed_magnitude]
-            vehicle.set_velocity(direction, speed_magnitude)
-        else:
-            # 速度为零时停止车辆
-            vehicle.set_velocity([1.0, 0.0], 0.0)
-        
-        # 可选：微调位置以确保与CSV数据同步
-        # 这有助于防止由于物理模拟误差导致的位置偏移
-        current_pos = vehicle.position
-        target_pos = [state["x"], state["y"]]
-        pos_error = np.sqrt((current_pos[0] - target_pos[0])**2 + (current_pos[1] - target_pos[1])**2)
-        
-        # 如果位置偏差过大，进行位置校正
-        if pos_error > 2.0:  # 偏差超过2米时进行校正
-            vehicle.set_position(target_pos)
-            print(f"Background vehicle {vehicle_id} position corrected: error={pos_error:.2f}m")
+            # 车辆定位更新：只更新车辆位置，朝向保持x正方向
+            v.set_position([state["x"], state["y"]])
+            # 朝向始终保持x正方向（0度），避免旋转导致的视觉问题
+            v.set_heading_theta(0.0)
+            # 设置速度大小（用于显示和诊断），但方向始终向前
+            direction = [1.0, 0.0]  # x正方向
+            v.set_velocity(direction, state["speed"])  # 设置速度大小，方向固定
 
 
     def _print_speed_comparison(self):
@@ -477,15 +394,11 @@ if __name__ == "__main__":
     print(f"Vehicle IDs: {list(traj_data.keys())}")
     
     # Create environment, enable manual control and PPO expert
-    # 演示新的背景车更新机制：
-    # - "position": 使用CSV位置直接更新（原kinematic模式）
-    # - "dynamics": 使用CSV速度通过物理引擎更新（物理模式）
     env = TrajectoryReplayEnv(
         traj_data, 
         config=dict(
             use_render=True, 
             manual_control=True,
-            background_vehicle_update_mode="dynamics",  # 可选: "position" 或 "dynamics"
         )
     )
     

@@ -335,7 +335,10 @@ class TrajectoryLoader:
                 "heading": heading,
                 "timestamp": target_time,  # 使用目标时间，便于同步
                 "original_timestamp": row["timestamp"],  # 保留原始时间戳
-                "time_error": time_error  # 记录时间误差
+                "time_error": time_error,  # 记录时间误差
+                # 新增：保留原始速度分量，用于动力学模式
+                "speed_x": row["speed_x"],
+                "speed_y": row["speed_y"]
             })
             
         return sampled_traj
