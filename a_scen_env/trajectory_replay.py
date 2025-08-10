@@ -90,9 +90,14 @@ class TrajectoryReplayEnv(MetaDriveEnv):
         
         super().__init__(default_config)
         
-        # 获取仿真时间步长
-        self.physics_world_step_size = self.engine.physics_world.static_world.getPhysicsWorldStepSize()
-        print(f"MetaDrive physics step size: {self.physics_world_step_size:.6f} seconds")
+        # 获取仿真时间步长（必须在super().__init__之后）
+        try:
+            self.physics_world_step_size = self.engine.physics_world.static_world.getPhysicsWorldStepSize()
+            print(f"MetaDrive physics step size: {self.physics_world_step_size:.6f} seconds")
+        except AttributeError:
+            # 如果无法获取，使用默认值
+            self.physics_world_step_size = 0.02  # 50Hz
+            print(f"Using default physics step size: {self.physics_world_step_size:.6f} seconds")
         
         # 检查轨迹数据的时间步长并设置同步
         self._setup_time_synchronization()
