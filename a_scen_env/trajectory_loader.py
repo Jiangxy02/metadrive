@@ -279,25 +279,26 @@ class TrajectoryLoader:
         
         # 使用时间采样而非插值
         target_dt = 1.0 / target_fps  # 目标时间步长
-        start_time = timestamps[0]
-        end_time = timestamps[-1]
-        
-        # 生成采样时间点
-        sample_times = np.arange(start_time, end_time + target_dt, target_dt)
         
         if self.verbose:
             print(f"\n时间采样设置:")
             print(f"  目标步长: {target_dt:.6f} 秒 ({target_fps:.1f} Hz)")
-            print(f"  采样后帧数: {len(sample_times)}")
-            print(f"  原始帧数: {len(timestamps)}")
-            print(f"  采样策略: 选择最接近的真实数据点")
+            print(f"  采样策略: 为每个车辆在其数据范围内选择最接近的真实数据点")
 
         for vid, group in grouped:
             group = group.reset_index(drop=True)
             
+            # 为每个车辆单独生成采样时间
+            vehicle_start_time = group['timestamp'].iloc[0]
+            vehicle_end_time = group['timestamp'].iloc[-1]
+            vehicle_sample_times = np.arange(vehicle_start_time, vehicle_end_time + target_dt, target_dt)
+            
             # 对每个车辆进行时间采样
-            sampled_traj = self._sample_vehicle_trajectory(group, sample_times)
+            sampled_traj = self._sample_vehicle_trajectory(group, vehicle_sample_times)
             trajectory_dict[int(vid)] = sampled_traj
+            
+            if self.verbose:
+                print(f"  Vehicle {vid}: {len(sampled_traj)} points, time range: {vehicle_start_time:.3f} - {vehicle_end_time:.3f}s")
             
         return trajectory_dict
     
@@ -307,7 +308,7 @@ class TrajectoryLoader:
         
         Args:
             vehicle_df: 单个车辆的数据
-            sample_times: 采样时间点数组
+            sample_times: 采样时间点数组（已确保在车辆数据范围内）
             
         Returns:
             List[Dict]: 采样后的轨迹点列表
@@ -324,6 +325,9 @@ class TrajectoryLoader:
             # 简化朝向处理：始终朝向x正方向（0度）
             heading = 0.0
             
+            # 计算真实的时间误差
+            time_error = abs(row["timestamp"] - target_time)
+            
             sampled_traj.append({
                 "x": row["position_x"],
                 "y": row["position_y"],
@@ -331,7 +335,7 @@ class TrajectoryLoader:
                 "heading": heading,
                 "timestamp": target_time,  # 使用目标时间，便于同步
                 "original_timestamp": row["timestamp"],  # 保留原始时间戳
-                "time_error": abs(row["timestamp"] - target_time)  # 记录时间误差
+                "time_error": time_error  # 记录时间误差
             })
             
         return sampled_traj
