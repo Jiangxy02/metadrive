@@ -53,7 +53,8 @@ class TrajectoryLoader:
                        max_duration: Optional[float] = 100, 
                        use_original_position: bool = False, 
                        translate_to_origin: bool = True,
-                       target_fps: float = 20.0) -> Dict[int, List[Dict]]:
+                       target_fps: float = 20.0,
+                       use_original_timestamps: bool = False) -> Dict[int, List[Dict]]:
         """
         加载CSV轨迹数据，并按需进行时间裁剪与位置平移
         
@@ -63,6 +64,8 @@ class TrajectoryLoader:
             max_duration: 仅加载最前面的若干秒数据（默认100秒）
             use_original_position: 是否保留原始坐标（不平移/缩放）
             translate_to_origin: 是否进行平移，使车辆-1位于可驾驶道路的合理起点
+            target_fps: 目标采样频率（仅在use_original_timestamps=False时使用）
+            use_original_timestamps: 是否使用CSV原始时间戳（不进行重采样）
             target_fps: 目标帧率，用于时间插值同步（默认20Hz，即0.05秒步长）
         
         Returns:
@@ -78,12 +81,15 @@ class TrajectoryLoader:
         """
         # 第一步：读取和排序CSV数据
         df = self._load_csv_data(csv_path)
+
+        # 第二步：数据预处理 - 删除position突变的异常行
+        df = self._preprocess_trajectory_data(df)
         
-        # 第二步：时间过滤
+        # 第三步：时间过滤
         if max_duration is not None:
             df = self._filter_by_duration(df, max_duration)
             
-        # 第三步：位置变换
+        # 第四步：位置变换
         if translate_to_origin:
             df = self._apply_translation_transform(df)
         elif use_original_position:
@@ -91,13 +97,16 @@ class TrajectoryLoader:
         elif normalize_position:
             df = self._apply_normalization_transform(df)
             
-        # 第四步：转换为轨迹字典格式
-        trajectory_dict = self._convert_to_trajectory_dict(df, target_fps)
+        # 第五步：转换为轨迹字典格式
+        if use_original_timestamps:
+            trajectory_dict = self._convert_to_trajectory_dict_original_timestamps(df)
+        else:
+            trajectory_dict = self._convert_to_trajectory_dict(df, target_fps)
         
-        # 第五步：输出统计信息
+        # 第六步：输出统计信息
         self._print_trajectory_summary(trajectory_dict)
         
-        # 第六步：分析采样质量
+        # 第七步：分析采样质量
         self._analyze_sampling_quality(trajectory_dict)
         
         return trajectory_dict
@@ -114,6 +123,107 @@ class TrajectoryLoader:
             print(f"Loaded {len(df)} data points for {df['vehicle_id'].nunique()} vehicles")
             
         return df
+        
+    def _preprocess_trajectory_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        数据预处理：删除position突变的异常行
+        
+        Args:
+            df: 原始DataFrame
+            
+        Returns:
+            pd.DataFrame: 预处理后的DataFrame
+        """
+        if self.verbose:
+            print(f"\n=== 数据预处理 ===")
+            print(f"原始数据点数: {len(df)}")
+            
+        df_cleaned = df.copy()
+        original_count = len(df_cleaned)
+        
+        # 1. 删除(0,0)点（明显的异常位置）
+        zero_mask = (df_cleaned['position_x'] == 0.0) & (df_cleaned['position_y'] == 0.0)
+        zero_count = zero_mask.sum()
+        df_cleaned = df_cleaned[~zero_mask].copy()
+        
+        if self.verbose and zero_count > 0:
+            print(f"  删除 (0,0) 异常点: {zero_count} 行")
+            
+        # 2. 检测并删除位置突变点（相邻帧间距离过大）
+        position_outliers_removed = 0
+        for vid in df_cleaned['vehicle_id'].unique():
+            vehicle_mask = df_cleaned['vehicle_id'] == vid
+            vehicle_data = df_cleaned[vehicle_mask].sort_values('timestamp').copy()
+            
+            if len(vehicle_data) < 2:
+                continue
+                
+            # 计算相邻点的位置差
+            vehicle_data['pos_diff'] = np.sqrt(
+                (vehicle_data['position_x'].diff())**2 + 
+                (vehicle_data['position_y'].diff())**2
+            )
+            
+            # 设置阈值：如果相邻点距离超过200米，认为是异常跳跃
+            # （正常车辆在0.01秒内不可能移动这么远）
+            distance_threshold = 200.0
+            outlier_mask = vehicle_data['pos_diff'] > distance_threshold
+            outlier_indices = vehicle_data[outlier_mask].index
+            
+            if len(outlier_indices) > 0:
+                position_outliers_removed += len(outlier_indices)
+                df_cleaned = df_cleaned.drop(outlier_indices)
+                
+        if self.verbose and position_outliers_removed > 0:
+            print(f"  删除位置突变点: {position_outliers_removed} 行")
+            
+        # 3. 删除速度异常点（速度过高）
+        # 计算速度幅值
+        df_cleaned['speed_magnitude'] = np.sqrt(df_cleaned['speed_x']**2 + df_cleaned['speed_y']**2)
+        
+        # 设置速度阈值：超过150 km/h (约42 m/s) 认为是异常
+        speed_threshold = 150.0 / 3.6  # 转换为 m/s
+        speed_outlier_mask = df_cleaned['speed_magnitude'] > speed_threshold
+        speed_outliers_removed = speed_outlier_mask.sum()
+        df_cleaned = df_cleaned[~speed_outlier_mask].copy()
+        
+        if self.verbose and speed_outliers_removed > 0:
+            print(f"  删除速度异常点: {speed_outliers_removed} 行")
+            
+        # 4. 删除时间间隔异常点
+        time_outliers_removed = 0
+        for vid in df_cleaned['vehicle_id'].unique():
+            vehicle_mask = df_cleaned['vehicle_id'] == vid
+            vehicle_data = df_cleaned[vehicle_mask].sort_values('timestamp').copy()
+            
+            if len(vehicle_data) < 2:
+                continue
+                
+            # 计算时间间隔
+            vehicle_data['time_diff'] = vehicle_data['timestamp'].diff()
+            
+            # 设置时间间隔阈值：超过1秒认为是数据中断
+            time_threshold = 1.0
+            time_outlier_mask = vehicle_data['time_diff'] > time_threshold
+            time_outlier_indices = vehicle_data[time_outlier_mask].index
+            
+            if len(time_outlier_indices) > 0:
+                time_outliers_removed += len(time_outlier_indices)
+                df_cleaned = df_cleaned.drop(time_outlier_indices)
+                
+        if self.verbose and time_outliers_removed > 0:
+            print(f"  删除时间间隔异常点: {time_outliers_removed} 行")
+            
+        # 清理临时列
+        df_cleaned = df_cleaned.drop(columns=['speed_magnitude'], errors='ignore')
+        
+        if self.verbose:
+            total_removed = original_count - len(df_cleaned)
+            print(f"  总计删除异常点: {total_removed} 行 ({total_removed/original_count*100:.1f}%)")
+            print(f"  预处理后数据点数: {len(df_cleaned)}")
+            print(f"  预处理后车辆数: {df_cleaned['vehicle_id'].nunique()}")
+            
+        return df_cleaned
         
     def _filter_by_duration(self, df: pd.DataFrame, max_duration: float) -> pd.DataFrame:
         """按时间长度过滤数据"""
@@ -139,6 +249,8 @@ class TrajectoryLoader:
             
         # 显示原始位置范围
         self._display_position_range(df, "Original position range")
+
+        print(translate_x, translate_y)
         
         # 应用平移变换
         df_translated = df.copy()
@@ -225,8 +337,8 @@ class TrajectoryLoader:
             return
             
         print(f"\n{title}:")
-        print(f"  X: [{df['position_x'].min():.1f}, {df['position_x'].max():.1f}]")
-        print(f"  Y: [{df['position_y'].min():.1f}, {df['position_y'].max():.1f}]")
+        print(f"  X: [{df['position_x'].min():.1f}, {df['position_x'].max():.1f}], diff: {df['position_x'].max() - df['position_x'].min():.1f}")
+        print(f"  Y: [{df['position_y'].min():.1f}, {df['position_y'].max():.1f}], diff: {df['position_y'].max() - df['position_y'].min():.1f}")
         
     def _display_vehicle_positions(self, df: pd.DataFrame):
         """显示各车辆初始位置和相对关系"""
@@ -302,6 +414,55 @@ class TrajectoryLoader:
             
         return trajectory_dict
     
+    def _convert_to_trajectory_dict_original_timestamps(self, df: pd.DataFrame) -> Dict[int, List[Dict]]:
+        """
+        基于CSV原始时间戳转换轨迹数据，不进行重采样
+        
+        Args:
+            df: 预处理后的DataFrame
+            
+        Returns:
+            Dict[int, List[Dict]]: 车辆轨迹字典
+        """
+        trajectory_dict = {}
+        grouped = df.groupby("vehicle_id")
+        
+        if self.verbose:
+            print(f"\n时间采样设置:")
+            print(f"  使用原始CSV时间戳 (无重采样)")
+            print(f"  保留所有原始数据点")
+
+        for vid, group in grouped:
+            group = group.reset_index(drop=True)
+            
+            # 直接使用原始数据，不进行时间采样
+            original_traj = []
+            for _, row in group.iterrows():
+                speed = np.sqrt(row["speed_x"]**2 + row["speed_y"]**2)
+                
+                original_traj.append({
+                    "x": row["position_x"],
+                    "y": row["position_y"], 
+                    "speed": speed,
+                    "heading": 0.0,  # 临时占位，稍后计算
+                    "timestamp": row["timestamp"],  # 使用原始时间戳
+                    "original_timestamp": row["timestamp"],  # 保留原始时间戳
+                    "time_error": 0.0,  # 无采样误差
+                    # 保留原始速度分量，用于动力学模式
+                    "speed_x": row["speed_x"],
+                    "speed_y": row["speed_y"]
+                })
+            
+            # 计算基于原始数据的稳定heading
+            self._calculate_stable_headings(original_traj)
+            
+            trajectory_dict[int(vid)] = original_traj
+            
+            if self.verbose:
+                print(f"  Vehicle {vid}: {len(original_traj)} original points, time range: {group['timestamp'].iloc[0]:.3f} - {group['timestamp'].iloc[-1]:.3f}s")
+        
+        return trajectory_dict
+    
     def _sample_vehicle_trajectory(self, vehicle_df: pd.DataFrame, sample_times: np.ndarray) -> List[Dict]:
         """
         对单个车辆的轨迹进行时间采样，选择最接近的真实数据点
@@ -316,14 +477,12 @@ class TrajectoryLoader:
         original_timestamps = vehicle_df['timestamp'].values
         
         sampled_traj = []
-        for target_time in sample_times:
+        for i, target_time in enumerate(sample_times):
             # 找到最接近的时间戳索引
             closest_idx = np.argmin(np.abs(original_timestamps - target_time))
             row = vehicle_df.iloc[closest_idx]
             
             speed = np.sqrt(row["speed_x"]**2 + row["speed_y"]**2)
-            # 简化朝向处理：始终朝向x正方向（0度）
-            heading = 0.0
             
             # 计算真实的时间误差
             time_error = abs(row["timestamp"] - target_time)
@@ -332,7 +491,7 @@ class TrajectoryLoader:
                 "x": row["position_x"],
                 "y": row["position_y"],
                 "speed": speed,
-                "heading": heading,
+                "heading": 0.0,  # 临时占位，稍后计算
                 "timestamp": target_time,  # 使用目标时间，便于同步
                 "original_timestamp": row["timestamp"],  # 保留原始时间戳
                 "time_error": time_error,  # 记录时间误差
@@ -340,8 +499,60 @@ class TrajectoryLoader:
                 "speed_x": row["speed_x"],
                 "speed_y": row["speed_y"]
             })
+        
+        # 计算基于采样数据的稳定heading
+        self._calculate_stable_headings(sampled_traj)
             
         return sampled_traj
+    
+    def _calculate_stable_headings(self, trajectory: List[Dict]):
+        """
+        基于采样轨迹数据计算稳定的heading，使用相邻点的位置差
+        
+        Args:
+            trajectory: 采样后的轨迹点列表（原地修改）
+        """
+        if len(trajectory) < 2:
+            # 如果只有一个点或没有点，保持默认heading
+            for point in trajectory:
+                point["heading"] = 0.0
+            return
+        
+        # 为每个点计算heading
+        for i in range(len(trajectory)):
+            if i == 0:
+                # 第一个点：使用与下一个点的方向
+                dx = trajectory[i + 1]["x"] - trajectory[i]["x"]
+                dy = trajectory[i + 1]["y"] - trajectory[i]["y"]
+            elif i == len(trajectory) - 1:
+                # 最后一个点：使用与前一个点的方向
+                dx = trajectory[i]["x"] - trajectory[i - 1]["x"]
+                dy = trajectory[i]["y"] - trajectory[i - 1]["y"]
+            else:
+                # 中间点：使用前后点的平均方向（更平滑）
+                dx1 = trajectory[i]["x"] - trajectory[i - 1]["x"]
+                dy1 = trajectory[i]["y"] - trajectory[i - 1]["y"]
+                dx2 = trajectory[i + 1]["x"] - trajectory[i]["x"]
+                dy2 = trajectory[i + 1]["y"] - trajectory[i]["y"]
+                dx = (dx1 + dx2) / 2.0
+                dy = (dy1 + dy2) / 2.0
+            
+            # 计算heading角度
+            if abs(dx) > 0.01 or abs(dy) > 0.01:  # 避免静止时的数值问题
+                heading = np.arctan2(dy, dx)
+            else:
+                heading = 0.0  # 静止时保持x正方向
+            
+            trajectory[i]["heading"] = heading
+            
+        if self.verbose and len(trajectory) > 0:
+            # 输出heading统计信息用于调试
+            headings = [point["heading"] for point in trajectory]
+            heading_changes = [abs(headings[i] - headings[i-1]) for i in range(1, len(headings))]
+            if heading_changes:
+                max_change = max(heading_changes) * 180 / np.pi  # 转换为度
+                avg_change = np.mean(heading_changes) * 180 / np.pi
+                print(f"    Heading stability: max_change={max_change:.1f}°, avg_change={avg_change:.1f}°")
         
     def _print_trajectory_summary(self, trajectory_dict: Dict[int, List[Dict]]):
         """输出轨迹数据统计摘要"""
@@ -438,15 +649,26 @@ class TrajectoryLoader:
 
 
 def load_trajectory(csv_path: str, 
-                   normalize_position: bool = False, 
-                   max_duration: Optional[float] = 100, 
-                   use_original_position: bool = False, 
+                   normalize_position: bool = False,
+                   max_duration: float = None,
+                   use_original_position: bool = False,
                    translate_to_origin: bool = True,
-                   target_fps: float = 20.0) -> Dict[int, List[Dict]]:
+                   target_fps: float = 50.0,
+                   use_original_timestamps: bool = False) -> Dict[int, List[Dict]]:
     """
-    便捷的轨迹加载函数（保持向后兼容性）
+    加载轨迹数据的便捷函数
     
-    这是TrajectoryLoader.load_trajectory的简化接口
+    Args:
+        csv_path: CSV文件路径
+        normalize_position: 是否归一化位置到[0,1]范围
+        max_duration: 最大加载时长（秒），None表示加载全部
+        use_original_position: 是否使用原始位置坐标（不进行变换）
+        translate_to_origin: 是否将主车起点平移到指定位置（仅在use_original_position=False时有效）
+        target_fps: 目标采样频率（仅在use_original_timestamps=False时使用）
+        use_original_timestamps: 是否使用CSV原始时间戳（不进行重采样）
+        
+    Returns:
+        Dict[int, List[Dict]]: 车辆ID到轨迹数据的映射
     """
     loader = TrajectoryLoader(verbose=True)
     return loader.load_trajectory(
@@ -455,7 +677,8 @@ def load_trajectory(csv_path: str,
         max_duration=max_duration,
         use_original_position=use_original_position,
         translate_to_origin=translate_to_origin,
-        target_fps=target_fps
+        target_fps=target_fps,
+        use_original_timestamps=use_original_timestamps
     )
 
 
