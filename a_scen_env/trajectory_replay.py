@@ -10,6 +10,12 @@ from metadrive.constants import HELP_MESSAGE
 from control_mode_manager import ControlModeManager
 from trajectory_loader import TrajectoryLoader, load_trajectory
 
+# ===== 新增：导入导航模块 =====
+from metadrive.component.navigation_module.node_network_navigation import NodeNetworkNavigation
+
+# ===== 新增：导入观测记录器 =====
+from observation_recorder import ObservationRecorder
+
 
 class TrajectoryReplayEnv(MetaDriveEnv):
     """
@@ -24,6 +30,14 @@ class TrajectoryReplayEnv(MetaDriveEnv):
       背景车仅用于渲染与参考，不影响主车的动力学与奖励。
     - 支持根据配置开关控制"碰撞/出界/到达终点/步数上限"是否结束仿真（在本类层面实现）。
     - 基于仿真时间的轨迹同步：解决CSV频率与MetaDrive更新频率不匹配的问题
+    - 支持背景车启用/禁用控制：可设置enable_background_vehicles参数决定是否显示背景车
+    
+    主要配置参数：
+    - enable_background_vehicles (bool): 是否启用背景车，默认True
+    - background_vehicle_update_mode (str): 背景车更新模式，"position"或"dynamics"
+    - enable_realtime (bool): 是否启用实时模式，默认True
+    - target_fps (float): 目标帧率，默认50.0
+    - disable_ppo_expert (bool): 是否禁用PPO专家，默认False
     
     使用说明（渲染窗口中热键）：
     - T/t：在 PPO Expert 与 Manual Control 之间切换
@@ -33,19 +47,37 @@ class TrajectoryReplayEnv(MetaDriveEnv):
     - W/A/S/D：加速/转向/刹车（在手动模式下生效）
     """
     def __init__(self, trajectory_dict, config=None):
+        # 先处理配置参数，获取enable_background_vehicles设置
+        user_config = config.copy() if config else {}
+        self.enable_background_vehicles = user_config.get("enable_background_vehicles", False)
+        
         # 复制trajectory_dict避免修改原数据
-        self.trajectory_dict = trajectory_dict.copy()
+        original_trajectory_dict = trajectory_dict.copy()
         
         # 将车辆-1设置为主车，从背景车辆中移除
         self.main_vehicle_trajectory = None
-        if -1 in self.trajectory_dict:
-            self.main_vehicle_trajectory = self.trajectory_dict.pop(-1)
+        if -1 in original_trajectory_dict:
+            self.main_vehicle_trajectory = original_trajectory_dict.pop(-1)
             print(f"Vehicle -1 will be used as the main car (agent)")
-            print(f"Remaining {len(self.trajectory_dict)} vehicles will be background vehicles")
         else:
             print("Warning: Vehicle -1 not found in trajectory data")
+        
+        # 根据enable_background_vehicles参数决定是否保留背景车数据
+        if self.enable_background_vehicles:
+            self.trajectory_dict = original_trajectory_dict
+            print(f"Loaded {len(self.trajectory_dict)} background vehicles from CSV")
+        else:
+            self.trajectory_dict = {}  # 清空背景车数据
+            print("⚠️  Background vehicles disabled - CSV background vehicle data skipped")
             
-        self.max_step = max(len(traj) for traj in trajectory_dict.values())
+        # 计算最大步数（如果没有背景车，使用主车轨迹长度）
+        if self.trajectory_dict:
+            self.max_step = max(len(traj) for traj in self.trajectory_dict.values())
+        elif self.main_vehicle_trajectory:
+            self.max_step = len(self.main_vehicle_trajectory)
+        else:
+            self.max_step = 1000  # 默认步数
+            
         self._step_count = 0
         
         # ===== 新增：仿真时间跟踪 =====
@@ -60,9 +92,9 @@ class TrajectoryReplayEnv(MetaDriveEnv):
         # 设置手动驾驶
         default_config = {
             "use_render": True,          # 是否开启渲染（True 表示显示可视化窗口）
-            "map": "S"*20,               # 地图结构：连续 20 个直线段（S 表示 Straight），
-                                        # 每段约 40-80 米，总长约 800-1600 米，
-                                        # 适合需要 100 秒左右行驶的长直道路场景
+            "map": "S"*8,                # 地图结构：连续 8 个直线段（S 表示 Straight），
+                                        # 每段约 40-80 米，总长约 320-640 米，
+                                        # 适合长距离驾驶测试，目标距离合理
             "manual_control": True,      # 是否开启手动控制（True 则允许键盘/手柄控制）
             "controller": "keyboard",    # 控制方式："keyboard" 表示使用键盘（WASD）驾驶
 
@@ -77,19 +109,29 @@ class TrajectoryReplayEnv(MetaDriveEnv):
             "traffic_density": 0.0,      # 设置为0.0完全禁用MetaDrive的自动交通生成
                                         # 确保只有CSV中指定的车辆出现在场景中
             
-            # 车辆显示配置（全部关闭导航标记，使视野更干净）
+            # ===== 新增：禁用静态障碍物 =====
+            "accident_prob": 0.0,        # 设置为0.0禁用随机事故和静态障碍物
+            "static_traffic_object": False,  # 禁用静态交通对象
+            
+            # 车辆显示配置（启用导航系统，为PPO expert提供明确目标）
             "vehicle_config": {
-                "show_navi_mark": False,         # 关闭导航目标点标记
-                "show_dest_mark": False,         # 关闭目的地标记
-                "show_line_to_dest": False,      # 关闭通往目的地的虚线
-                "show_line_to_navi_mark": False, # 关闭通往导航标记的虚线
-                "show_navigation_arrow": False,  # 关闭导航方向箭头
+                "show_navi_mark": True,          # 开启导航目标点标记
+                "show_dest_mark": True,          # 开启目的地标记
+                "show_line_to_dest": True,       # 开启通往目的地的虚线
+                "show_line_to_navi_mark": True,  # 开启通往导航标记的虚线
+                "show_navigation_arrow": True,   # 开启导航方向箭头
+                
+                # ===== 新增：确保导航模块正确配置 =====
+                "navigation_module": NodeNetworkNavigation,  # 明确指定导航模块
+                "destination": None,             # 让系统自动分配目标
+                "spawn_lane_index": None,        # 让系统自动选择起始车道
             }
         }
         
         # 自定义"结束条件开关"不属于MetaDrive底层可识别的配置键，
         # 因此在本类中以实例属性保存，并从用户传入的config中pop后再传给父类。
-        user_config = config.copy() if config else {}  # 复制一份用户传入的配置，避免直接修改原字典
+        # user_config已在前面创建，这里移除已处理的参数
+        user_config.pop("enable_background_vehicles", None)  # 移除已处理的参数
         
         # ===== 新增：帧率控制 =====
         self.enable_realtime = user_config.pop("enable_realtime", True)  # 是否启用实时模式
@@ -111,6 +153,22 @@ class TrajectoryReplayEnv(MetaDriveEnv):
         if self.background_vehicle_update_mode not in ["position", "dynamics"]:
             print(f"Warning: Unknown background_vehicle_update_mode '{self.background_vehicle_update_mode}', defaulting to 'position'")
             self.background_vehicle_update_mode = "position"
+
+        # enable_background_vehicles参数已在初始化开始时处理
+
+        # ===== 新增：PPO专家禁用标志（用于训练） =====
+        self.disable_ppo_expert = user_config.pop("disable_ppo_expert", False)
+        if self.disable_ppo_expert:
+            print("PPO expert disabled for training mode")
+
+        # ===== 新增：观测记录器配置 =====
+        self.enable_observation_recording = user_config.pop("enable_observation_recording", False)
+        self.observation_recorder = None
+        if self.enable_observation_recording:
+            session_name = user_config.pop("recording_session_name", None)
+            output_dir = user_config.pop("recording_output_dir", "observation_logs")
+            self.observation_recorder = ObservationRecorder(output_dir=output_dir, session_name=session_name)
+            print("✅ 观测记录器已启用")
 
         if user_config:
             default_config.update(user_config)
@@ -150,6 +208,9 @@ class TrajectoryReplayEnv(MetaDriveEnv):
         - 初始化控制模式管理器；
         - 若存在车辆-1的轨迹，则将主车初始化到其轨迹的第一个状态（位置/朝向/速度）。
         """
+        # 清理之前的背景车
+        self._cleanup_ghost_vehicles()
+        
         obs = super().reset()
         self._step_count = 0
         self._simulation_time = 0.0  # 重置仿真时间
@@ -170,6 +231,10 @@ class TrajectoryReplayEnv(MetaDriveEnv):
         # 初始化轨迹起始时间
         self._initialize_trajectory_start_time()
         
+        # 在engine可用后设置disable_ppo_expert标志
+        if hasattr(self, 'disable_ppo_expert') and self.disable_ppo_expert and self.engine:
+            self.engine.global_config["disable_ppo_expert"] = True
+        
         # 设置主车实例到控制管理器
         self.control_manager.set_agent(self.agent)
         
@@ -179,6 +244,12 @@ class TrajectoryReplayEnv(MetaDriveEnv):
         
         # 初始化控制策略
         self.control_manager.initialize_policies()
+        
+        # ===== 新增：设置自定义目标点 =====
+        self._set_custom_destination()
+        
+        # ===== 新增：调试导航信息 =====
+        self._debug_navigation_info()
         
         # 设置主车初始状态为车辆-1的初始状态
         if self.main_vehicle_trajectory and len(self.main_vehicle_trajectory) > 0:
@@ -191,8 +262,528 @@ class TrajectoryReplayEnv(MetaDriveEnv):
             self.agent.set_velocity(direction, initial_state["speed"])
             print(f"Main car initialized at original position: ({initial_state['x']:.1f}, {initial_state['y']:.1f})")
             print(f"Initial heading: {initial_state['heading']:.2f} rad, speed: {initial_state['speed']:.1f} m/s")
+            
+            # ===== 新增：在主车位置设置后修复车道检测问题 =====
+            self._fix_lane_detection()
         
         return obs
+
+    def _debug_navigation_info(self):
+        """
+        调试导航信息，检查导航系统是否正确配置
+        """
+        if hasattr(self.agent, 'navigation') and self.agent.navigation:
+            nav = self.agent.navigation
+            print(f"\n=== Navigation Debug Info ===")
+            print(f"Navigation module: {type(nav).__name__}")
+            print(f"Current lane: {nav.current_lane.index if nav.current_lane else 'None'}")
+            print(f"Destination: {getattr(nav, 'final_lane', 'Not set')}")
+            print(f"Route length: {len(getattr(nav, 'route', []))}")
+            print(f"Route completion: {nav.route_completion:.3f}")
+            
+            # 检查是否有有效的导航路径
+            if hasattr(nav, 'route') and nav.route and len(nav.route) > 1:
+                print(f"✅ Navigation route established: {nav.route[:3]}{'...' if len(nav.route) > 3 else ''}")
+            else:
+                print(f"❌ Warning: No valid navigation route found!")
+                print(f"   This may cause PPO expert to remain stationary")
+                
+                # 🔧 自动修复导航路径
+                print(f"🚀 尝试自动修复导航路径...")
+                try:
+                    from fix_navigation_route import fix_navigation_for_env
+                    success = fix_navigation_for_env(self)
+                    if success:
+                        print(f"✅ 导航路径修复成功!")
+                        # 重新检查路径
+                        if hasattr(nav, 'route') and nav.route and len(nav.route) > 1:
+                            print(f"✅ 修复后路径: {nav.route[:3]}{'...' if len(nav.route) > 3 else ''}")
+                    else:
+                        print(f"❌ 导航路径修复失败，PPO可能无法正常工作")
+                except ImportError:
+                    print(f"⚠️ 导航修复模块未找到，请检查 fix_navigation_route.py 文件")
+                except Exception as e:
+                    print(f"❌ 导航修复过程中出错: {e}")
+                
+            # 检查目标距离
+            if hasattr(nav, 'distance_to_destination'):
+                print(f"Distance to destination: {nav.distance_to_destination:.1f}m")
+            
+            # 显示自定义目标点信息
+            if hasattr(self, 'custom_destination'):
+                dest = self.custom_destination
+                agent_pos = self.agent.position
+                distance_to_custom_dest = np.sqrt((agent_pos[0] - dest[0])**2 + (agent_pos[1] - dest[1])**2)
+                print(f"Custom destination: ({dest[0]:.1f}, {dest[1]:.1f})")
+                print(f"Distance to custom dest: {distance_to_custom_dest:.1f}m")
+            
+            print(f"=============================\n")
+        else:
+            print(f"❌ Error: Agent has no navigation module!")
+
+    def _set_custom_destination(self):
+        """
+        设置自定义目标点：所有车辆轨迹中x坐标的最大值，y坐标设置为合适的车道位置
+        """
+        # 计算轨迹数据中x坐标的最大值
+        max_x = float('-inf')
+        target_y = 0.0  # 默认y坐标
+        
+        # 根据enable_background_vehicles参数决定是否包含背景车
+        if self.enable_background_vehicles and self.trajectory_dict:
+            for vehicle_id, trajectory in self.trajectory_dict.items():
+                for point in trajectory:
+                    if point["x"] > max_x:
+                        max_x = point["x"]
+                        target_y = point["y"]  # 使用达到最大x时的y坐标作为参考
+        
+        # 如果有主车轨迹，也包含在计算中
+        if self.main_vehicle_trajectory:
+            for point in self.main_vehicle_trajectory:
+                if point["x"] > max_x:
+                    max_x = point["x"]
+                    target_y = point["y"]
+        
+        if max_x == float('-inf'):
+            print("Warning: Could not calculate destination from trajectory data")
+            # 如果没有轨迹数据，设置一个默认的远处目标
+            max_x = 500.0  # 默认500米远的目标
+            target_y = 0.0
+            print(f"Using default destination: ({max_x:.1f}, {target_y:.1f})")
+        
+        if not self.enable_background_vehicles:
+            print("Note: Destination calculated from main vehicle trajectory only (background vehicles disabled)")
+            
+        target_position = [max_x, target_y]
+        print(f"\n=== Custom Destination Setup ===")
+        print(f"Calculated destination: ({max_x:.1f}, {target_y:.1f})")
+        
+        # 尝试找到最接近目标位置的车道
+        try:
+            # 使用MetaDrive的车道定位功能找到最近的车道
+            if hasattr(self.engine, 'current_map') and self.engine.current_map:
+                current_map = self.engine.current_map
+                
+                # 查找最接近目标位置的车道
+                closest_lane = None
+                min_distance = float('inf')
+                
+                for road in current_map.road_network.graph.keys():
+                    for lane_index in current_map.road_network.graph[road].keys():
+                        lane = current_map.road_network.get_lane((road, lane_index))
+                        if lane:
+                            # 计算车道中心线上最接近目标点的位置
+                            lane_length = lane.length
+                            # 检查车道末端位置
+                            end_position = lane.position(lane_length, 0)
+                            distance = np.sqrt((end_position[0] - max_x)**2 + (end_position[1] - target_y)**2)
+                            
+                            if distance < min_distance:
+                                min_distance = distance
+                                closest_lane = lane
+                                # 更新目标y坐标为车道中心
+                                target_y = end_position[1]
+                
+                if closest_lane:
+                    target_position = [max_x, target_y]
+                    print(f"Adjusted destination to nearest lane: ({max_x:.1f}, {target_y:.1f})")
+                    print(f"Target lane: {closest_lane.index}")
+                    
+                    # 设置导航目标 - 修复版本
+                    if hasattr(self.agent, 'navigation') and self.agent.navigation:
+                        # 🔧 修复：使用PG地图的正确导航设置
+                        navigation_success = self._fix_pg_map_navigation()
+                        
+                        if not navigation_success:
+                            # 备用方案：尝试原有逻辑
+                            try:
+                                # 查找包含目标位置的车道索引
+                                target_lane_index = closest_lane.index
+                                self.agent.navigation.set_route(
+                                    self.agent.navigation.current_lane.index,
+                                    target_lane_index
+                                )
+                                print(f"✅ Navigation route set to lane: {target_lane_index}")
+                                navigation_success = True
+                            except Exception as e:
+                                print(f"⚠️  Could not set navigation route: {e}")
+                                # 手动设置目标位置
+                                if hasattr(self.agent.navigation, 'destination_point'):
+                                    self.agent.navigation.destination_point = target_position
+                                    print(f"🔧 Fall back to manual destination: {target_position}")
+                        
+                        # 如果所有方案都失败，调用外部修复模块
+                        if not navigation_success:
+                            print(f"🚨 所有导航设置都失败，调用外部修复模块...")
+                            try:
+                                from fix_navigation_route import fix_navigation_for_env
+                                success = fix_navigation_for_env(self)
+                                if success:
+                                    print(f"✅ 外部修复模块成功修复导航!")
+                                else:
+                                    print(f"❌ 外部修复模块也无法修复导航")
+                            except ImportError:
+                                print(f"⚠️ 外部修复模块未找到")
+                            except Exception as repair_e:
+                                print(f"❌ 外部修复模块出错: {repair_e}")
+                else:
+                    print(f"Warning: Could not find suitable lane for destination")
+                    
+        except Exception as e:
+            print(f"Error in destination setup: {e}")
+            
+        # 存储目标位置供调试使用
+        self.custom_destination = target_position
+        print(f"Final destination: ({target_position[0]:.1f}, {target_position[1]:.1f})")
+        print(f"================================\n")
+
+    def _fix_pg_map_navigation(self):
+        """
+        修复PG地图（程序化生成地图）的导航路径
+        专门针对 "S"*8 类型的直线地图
+        
+        Returns:
+            bool: 修复是否成功
+        """
+        print(f"🔧 尝试修复PG地图导航路径...")
+        
+        try:
+            # 获取当前地图和道路网络
+            current_map = self.engine.current_map
+            road_network = current_map.road_network
+            
+            # 获取当前车道
+            current_lane = self.agent.navigation.current_lane
+            if not current_lane:
+                print(f"❌ 无法获取当前车道")
+                return False
+            
+            current_lane_index = current_lane.index
+            print(f"📍 当前车道: {current_lane_index}")
+            
+            # 策略1: 查找地图中的最后一个车道段作为目标
+            all_road_segments = list(road_network.graph.keys())
+            print(f"🗺️ 地图包含 {len(all_road_segments)} 个道路段: {all_road_segments}")
+            
+            # 对于 "S"*8 类型的地图，查找最远的车道
+            target_lane_index = None
+            max_distance = 0
+            
+            for road_start in all_road_segments:
+                for road_end in road_network.graph[road_start].keys():
+                    for lane_idx, lane in road_network.graph[road_start][road_end].items():
+                        if lane:
+                            # 计算车道末端位置
+                            lane_end_pos = lane.position(lane.length, 0)
+                            # 计算距离当前位置的距离
+                            current_pos = self.agent.position
+                            distance = np.sqrt((lane_end_pos[0] - current_pos[0])**2 + 
+                                             (lane_end_pos[1] - current_pos[1])**2)
+                            
+                            if distance > max_distance:
+                                max_distance = distance
+                                target_lane_index = (road_start, road_end, lane_idx)
+                                print(f"🎯 找到更远的目标车道: {target_lane_index}, 距离: {distance:.1f}m")
+            
+            if target_lane_index:
+                print(f"🎯 设置导航路径:")
+                print(f"  起始车道: {current_lane_index}")
+                print(f"  目标车道: {target_lane_index}")
+                print(f"  目标距离: {max_distance:.1f}m")
+                
+                # 尝试设置路径
+                self.agent.navigation.set_route(current_lane_index, target_lane_index)
+                
+                # 验证路径是否成功设置
+                if hasattr(self.agent.navigation, 'route') and self.agent.navigation.route:
+                    print(f"✅ PG地图导航路径设置成功!")
+                    print(f"📍 路径: {self.agent.navigation.route[:3]}{'...' if len(self.agent.navigation.route) > 3 else ''}")
+                    return True
+                else:
+                    print(f"❌ 路径设置后验证失败")
+                    return False
+            else:
+                print(f"❌ 未找到合适的目标车道")
+                return False
+                
+        except Exception as e:
+            print(f"❌ PG地图导航修复失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _find_next_lane(self, current_lane, road_network):
+        """寻找当前车道的下一个车道"""
+        
+        try:
+            current_index = current_lane.index
+            
+            # 解析当前车道索引
+            if len(current_index) >= 3:
+                current_start = current_index[0]
+                current_end = current_index[1]
+                lane_idx = current_index[2]
+                
+                # 在道路网络中寻找以current_end为起点的车道
+                if current_end in road_network.graph:
+                    for next_end in road_network.graph[current_end].keys():
+                        lanes = road_network.graph[current_end][next_end]
+                        
+                        # 处理不同的lanes数据结构
+                        if hasattr(lanes, 'items'):
+                            lane_items = lanes.items()
+                        elif isinstance(lanes, (list, tuple)):
+                            lane_items = enumerate(lanes)
+                        else:
+                            continue
+                        
+                        for next_lane_idx, next_lane in lane_items:
+                            if next_lane and next_lane_idx == lane_idx:  # 保持相同的车道编号
+                                return next_lane
+                                
+                        # 如果没有找到相同编号的车道，返回第一个可用车道
+                        for next_lane_idx, next_lane in lane_items:
+                            if next_lane:
+                                return next_lane
+            
+            return None
+            
+        except Exception as e:
+            print(f"⚠️ 查找下一个车道失败: {e}")
+            return None
+
+    def _fix_lane_detection(self):
+        """修复车道检测问题 - 根据主车实际位置重新检测正确的当前车道"""
+        
+        print("🔧 开始修复车道检测...")
+        
+        try:
+            agent = self.agent
+            navigation = agent.navigation
+            current_map = self.engine.current_map
+            road_network = current_map.road_network
+            agent_pos = agent.position
+            
+            print(f"📍 主车实际位置: ({agent_pos[0]:.1f}, {agent_pos[1]:.1f})")
+            print(f"❌ 错误检测车道: {navigation.current_lane.index}")
+            
+            # 找到主车真正所在的车道
+            best_lane = None
+            min_distance = float('inf')
+            
+            for road_start in road_network.graph.keys():
+                for road_end in road_network.graph[road_start].keys():
+                    lanes = road_network.graph[road_start][road_end]
+                    
+                    # 处理不同的lanes数据结构
+                    if hasattr(lanes, 'items'):
+                        lane_items = lanes.items()
+                    elif isinstance(lanes, (list, tuple)):
+                        lane_items = enumerate(lanes)
+                    else:
+                        continue
+                    
+                    for lane_idx, lane in lane_items:
+                        if lane:
+                            try:
+                                # 计算主车在此车道上的位置
+                                local_coords = lane.local_coordinates(agent_pos)
+                                longitudinal = local_coords[0]
+                                lateral = local_coords[1]
+                                
+                                # 检查主车是否在此车道上
+                                is_on_lane = (0 <= longitudinal <= lane.length) and (abs(lateral) < 5)
+                                
+                                if is_on_lane:
+                                    # 计算距离车道中心的距离作为优先级
+                                    distance = abs(lateral)
+                                    if distance < min_distance:
+                                        min_distance = distance
+                                        best_lane = lane
+                                        
+                            except Exception as e:
+                                continue
+            
+            if best_lane:
+                print(f"✅ 找到正确车道: {best_lane.index}")
+                print(f"🎯 车道位置: ({best_lane.position(0, 0)[0]:.1f}, {best_lane.position(0, 0)[1]:.1f}) → ({best_lane.position(best_lane.length, 0)[0]:.1f}, {best_lane.position(best_lane.length, 0)[1]:.1f})")
+                
+                # 1. 强制更新当前车道
+                navigation._current_lane = best_lane
+                
+                # 2. 更新参考车道 - 这是检查点计算的基础
+                navigation.current_ref_lanes = [best_lane]
+                print(f"✅ 更新当前参考车道: {best_lane.index}")
+                
+                # 3. 寻找下一个车道作为next_ref_lanes
+                next_lane = self._find_next_lane(best_lane, road_network)
+                if next_lane:
+                    navigation.next_ref_lanes = [next_lane]
+                    print(f"✅ 更新下一个参考车道: {next_lane.index}")
+                else:
+                    navigation.next_ref_lanes = [best_lane]  # 如果没有下一个车道，使用当前车道
+                    print(f"⚠️ 未找到下一个车道，使用当前车道")
+                
+                # 4. 重置检查点索引
+                if hasattr(navigation, '_target_checkpoints_index'):
+                    navigation._target_checkpoints_index = [0, 1]
+                    print(f"✅ 重置检查点索引: [0, 1]")
+                
+                # 5. 更新导航状态
+                navigation.update_localization(agent)
+                
+                print(f"✅ 车道检测和导航路径修复成功!")
+                return True
+            else:
+                print(f"❌ 无法找到主车所在的正确车道")
+                return False
+                
+        except Exception as e:
+            print(f"❌ 车道检测修复失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _check_and_fix_checkpoint_issue(self):
+        """
+        检查和修复引导点问题
+        
+        问题：如果检查点在主车后方，会导致route_completion为负数，PPO认为需要倒退
+        """
+        print(f"🔍 检查引导点问题...")
+        
+        try:
+            agent = self.agent
+            navigation = agent.navigation
+            
+            # 检查是否有引导点在后方
+            has_backward_checkpoint = False
+            
+            try:
+                checkpoint1, checkpoint2 = navigation.get_checkpoints()
+                agent_pos = agent.position[:2]
+                
+                for i, checkpoint in enumerate([checkpoint1, checkpoint2]):
+                    ckpt_pos = checkpoint[:2]
+                    
+                    # 计算方向向量（从主车到检查点）
+                    direction_vec = np.array(ckpt_pos) - np.array(agent_pos)
+                    
+                    # 计算主车朝向
+                    heading = agent.heading_theta
+                    heading_vec = np.array([np.cos(heading), np.sin(heading)])
+                    
+                    # 检查点是否在前方（点积 > 0表示前方）
+                    dot_product = np.dot(direction_vec, heading_vec)
+                    is_forward = dot_product > 0
+                    
+                    distance = np.sqrt(direction_vec[0]**2 + direction_vec[1]**2)
+                    direction_str = "前方" if is_forward else "后方"
+                    
+                    print(f"  检查点{i+1}: ({ckpt_pos[0]:.1f}, {ckpt_pos[1]:.1f}), " +
+                          f"距离={distance:.1f}m, 方向={direction_str}")
+                    
+                    if not is_forward:
+                        has_backward_checkpoint = True
+                        print(f"  ❌ 检查点{i+1}在主车后方!")
+                        
+            except Exception as e:
+                print(f"⚠️ 无法获取检查点信息: {e}")
+            
+            # 检查路径完成度
+            route_completion = getattr(navigation, 'route_completion', 0)
+            travelled_length = getattr(navigation, 'travelled_length', 0)
+            
+            print(f"  路径完成度: {route_completion:.3f}")
+            print(f"  已行驶距离: {travelled_length:.2f}m")
+            
+            # 如果发现问题，进行修复
+            if has_backward_checkpoint or route_completion < 0 or travelled_length < 0:
+                print(f"🔧 发现引导点问题，开始自动修复...")
+                
+                # 修复方法1: 重置已行驶距离
+                if hasattr(navigation, 'travelled_length'):
+                    old_travelled = navigation.travelled_length
+                    navigation.travelled_length = 0.0
+                    print(f"  重置已行驶距离: {old_travelled:.2f} → 0.0")
+                
+                # 修复方法2: 重置参考车道位置
+                if hasattr(navigation, '_last_long_in_ref_lane') and hasattr(navigation, 'current_ref_lanes'):
+                    if navigation.current_ref_lanes:
+                        ref_lane = navigation.current_ref_lanes[0]
+                        current_long, _ = ref_lane.local_coordinates(agent.position)
+                        navigation._last_long_in_ref_lane = current_long
+                        print(f"  重置参考车道位置: {navigation._last_long_in_ref_lane:.2f}")
+                
+                # 修复方法3: 如果仍有问题，强制重新设置导航
+                new_completion = getattr(navigation, 'route_completion', -1)
+                if new_completion < 0:
+                    print(f"  路径完成度仍为负数，尝试重新设置导航...")
+                    try:
+                        success = self._fix_pg_map_navigation()
+                        if success:
+                            print(f"  ✅ 导航重新设置成功")
+                        else:
+                            print(f"  ⚠️ 导航重设失败，使用基础修复")
+                            # 强制设置为小的正数
+                            if hasattr(navigation, 'total_length') and navigation.total_length > 0:
+                                navigation.travelled_length = 0.01 * navigation.total_length
+                                print(f"  强制设置路径完成度为 0.01")
+                    except Exception as e:
+                        print(f"  ❌ 导航重设过程出错: {e}")
+                
+                # 验证修复效果
+                final_completion = getattr(navigation, 'route_completion', -1)
+                print(f"  修复后路径完成度: {final_completion:.3f}")
+                
+                if final_completion >= 0:
+                    print(f"✅ 引导点问题修复成功!")
+                else:
+                    print(f"❌ 引导点问题仍然存在")
+            else:
+                print(f"✅ 没有检测到引导点问题")
+                
+        except Exception as e:
+            print(f"❌ 引导点检查过程出错: {e}")
+
+    def _debug_ppo_action_info(self, action, action_info):
+        """
+        调试PPO专家动作信息
+        """
+        print(f"\n=== PPO Action Debug (Step {self._step_count}) ===")
+        print(f"Action source: {action_info.get('source', 'unknown')}")
+        print(f"Action success: {action_info.get('success', 'unknown')}")
+        print(f"Action values: [{action[0]:.3f}, {action[1]:.3f}] (steering, throttle)")
+        
+        # 检查主车状态
+        print(f"Agent position: ({self.agent.position[0]:.1f}, {self.agent.position[1]:.1f})")
+        print(f"Agent speed: {self.agent.speed:.2f} m/s")
+        print(f"Agent heading: {self.agent.heading_theta:.3f} rad")
+        
+        # 检查导航状态
+        if hasattr(self.agent, 'navigation') and self.agent.navigation:
+            nav = self.agent.navigation
+            print(f"Route completion: {nav.route_completion:.3f}")
+            if hasattr(nav, 'distance_to_destination'):
+                print(f"Distance to dest: {nav.distance_to_destination:.1f}m")
+        
+        # 显示自定义目标点信息
+        if hasattr(self, 'custom_destination'):
+            dest = self.custom_destination
+            agent_pos = self.agent.position
+            distance_to_custom_dest = np.sqrt((agent_pos[0] - dest[0])**2 + (agent_pos[1] - dest[1])**2)
+            print(f"Custom destination: ({dest[0]:.1f}, {dest[1]:.1f})")
+            print(f"Distance to custom dest: {distance_to_custom_dest:.1f}m")
+        
+        # 检查专家takeover状态
+        if hasattr(self.agent, 'expert_takeover'):
+            print(f"Expert takeover: {self.agent.expert_takeover}")
+        
+        # 输出错误信息（如果有）
+        if 'error' in action_info:
+            print(f"❌ Error: {action_info['error']}")
+        
+        print(f"=======================================\n")
 
     def step(self, action):
         """
@@ -235,9 +826,25 @@ class TrajectoryReplayEnv(MetaDriveEnv):
         
         # 使用控制管理器获取动作
         action, action_info = self.control_manager.get_action(action)
-        # exit()        
+        
+        # ===== 新增：调试PPO专家动作 =====
+        if self._step_count % 20 == 0:  # 每20步输出一次调试信息
+            self._debug_ppo_action_info(action, action_info)
+        
         # 推进主车（在轨迹重放模式下，这主要是为了保持环境状态一致性）
         obs, reward, terminated, truncated, info = super().step(action)
+        
+        # ===== 新增：记录观测状态 =====
+        if self.observation_recorder:
+            self.observation_recorder.record_step(
+                env=self,
+                action=action,
+                action_info=action_info,
+                obs=obs,
+                reward=reward,
+                info=info,
+                step_count=self._step_count
+            )
         
         # 重放背景车（基于仿真时间而非步数）
         self._replay_all_vehicles_by_time()
@@ -281,6 +888,17 @@ class TrajectoryReplayEnv(MetaDriveEnv):
         info["action_source"] = action_info.get("source", "unknown")
         
         return obs, reward, done, info
+
+    def _cleanup_ghost_vehicles(self):
+        """
+        清理所有背景车对象
+        """
+        for vid, vehicle in self.ghost_vehicles.items():
+            try:
+                vehicle.destroy()
+            except:
+                pass  # 忽略销毁失败的情况
+        self.ghost_vehicles = {}
 
     def _initialize_trajectory_start_time(self):
         """
@@ -423,7 +1041,12 @@ class TrajectoryReplayEnv(MetaDriveEnv):
           2) dynamics模式：使用CSV中的speed_x, speed_y通过物理引擎更新车辆，
              更真实地模拟车辆运动
         - 当轨迹结束时，当前实现选择移除车辆。
+        - 根据enable_background_vehicles参数决定是否启用背景车
         """
+        # 如果禁用背景车，直接返回
+        if not self.enable_background_vehicles:
+            return
+            
         for vid, traj in self.trajectory_dict.items():  # 遍历每辆车的轨迹数据
             # 根据仿真时间获取当前状态
             state = self._get_trajectory_state_at_time(traj, self._simulation_time)
@@ -574,7 +1197,7 @@ class TrajectoryReplayEnv(MetaDriveEnv):
         print(f"Main Car: Actual={main_actual_speed:.1f} m/s, Expected={main_expected_speed} m/s")
         
         # 背景车速度信息
-        if self.ghost_vehicles:
+        if self.enable_background_vehicles and self.ghost_vehicles:
             print(f"Background Vehicles:")
             for vid, traj in self.trajectory_dict.items():
                 if vid in self.ghost_vehicles:
@@ -589,6 +1212,8 @@ class TrajectoryReplayEnv(MetaDriveEnv):
                         print(f"  Vehicle {vid}: Actual={actual_speed:.1f} m/s, Expected={expected_speed:.1f} m/s, Pos=({position[0]:.1f}, {position[1]:.1f})")
                     else:
                         print(f"  Vehicle {vid}: Trajectory ended")
+        elif not self.enable_background_vehicles:
+            print("Background Vehicles: Disabled")
         
         print("=" * 50)
 
@@ -646,6 +1271,13 @@ class TrajectoryReplayEnv(MetaDriveEnv):
         real_elapsed_time = self._real_time_module.time() - self._real_start_time if self._real_start_time else 0.0
         time_ratio = self._simulation_time / real_elapsed_time if real_elapsed_time > 0 else 0.0
         
+        # 计算到自定义目标点的距离
+        distance_to_dest = "N/A"
+        if hasattr(self, 'custom_destination'):
+            dest = self.custom_destination
+            agent_pos = self.agent.position
+            distance_to_dest = f"{np.sqrt((agent_pos[0] - dest[0])**2 + (agent_pos[1] - dest[1])**2):.1f}m"
+        
         render_text.update({
             "Step": f"{self._step_count}/{self.max_step}",
             "Simulation Time": f"{self._simulation_time:.1f}s",
@@ -656,10 +1288,22 @@ class TrajectoryReplayEnv(MetaDriveEnv):
             "Target FPS": f"{self.target_fps:.0f}",
             "Main Car Position": f"({self.agent.position[0]:.1f}, {self.agent.position[1]:.1f})",
             "Main Car Speed": f"{self.agent.speed:.1f} m/s",
-            "Background Vehicles": len(self.ghost_vehicles),
+            "Distance to Destination": distance_to_dest,
+            "Background Vehicles": f"{len(self.ghost_vehicles)}" + ("" if self.enable_background_vehicles else " (Disabled)"),
         })
         kwargs["text"] = render_text
         return super().render(*args, **kwargs)
+
+    def close(self):
+        """
+        关闭环境并清理资源
+        """
+        # ===== 新增：结束观测记录 =====
+        if self.observation_recorder:
+            self.observation_recorder.finalize_recording()
+            
+        self._cleanup_ghost_vehicles()
+        super().close()
 
 
 if __name__ == "__main__":
@@ -683,19 +1327,34 @@ if __name__ == "__main__":
     print(f"Vehicle IDs: {list(traj_data.keys())}")
     
     # Create environment, enable manual control and PPO expert
-    # 演示新的背景车更新机制：
-    # - "position": 使用CSV位置直接更新（原kinematic模式）
-    # - "dynamics": 使用CSV速度通过物理引擎更新（物理模式）
+    # 演示背景车控制选项：
+    # - enable_background_vehicles=True: 显示所有CSV中的背景车（默认）
+    # - enable_background_vehicles=False: 只显示主车，跳过背景车加载
+    
+    # 示例1：启用背景车（默认行为）
     env = TrajectoryReplayEnv(
         traj_data, 
         config=dict(
             use_render=True, 
             manual_control=True,
             background_vehicle_update_mode="position",  # 可选: "position" 或 "dynamics"
+            enable_background_vehicles=False,  # 是否启用背景车（默认True）
             enable_realtime=True,  # 启用实时模式，使仿真以真实时间速度运行
             target_fps=50.0,       # 目标帧率，匹配物理步长 (50Hz = 0.02s per step)
         )
     )
+    
+    # 示例2：禁用背景车（纯净单车环境）
+    # env = TrajectoryReplayEnv(
+    #     traj_data, 
+    #     config=dict(
+    #         use_render=True, 
+    #         manual_control=True,
+    #         enable_background_vehicles=False,  # 🔥 禁用背景车，只有主车
+    #         enable_realtime=True,
+    #         target_fps=50.0,
+    #     )
+    # )
     
     obs = env.reset()
     

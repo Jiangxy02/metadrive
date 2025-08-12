@@ -15,7 +15,29 @@
 """
 
 from metadrive.policy.manual_control_policy import ManualControlPolicy
-from metadrive.examples import expert
+
+# 尝试导入PPO专家策略，如果失败则使用原版expert
+try:
+    # 首先尝试从当前目录的PPO子目录导入
+    import sys
+    import os
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    ppo_dir = os.path.join(current_dir, 'PPO')
+    if ppo_dir not in sys.path:
+        sys.path.insert(0, ppo_dir)
+    
+    from ppo_expert import expert
+    print("Using trained PPO expert model")
+except (ImportError, FileNotFoundError, Exception) as e:
+    print(f"Failed to import custom PPO expert: {e}")
+    try:
+        from metadrive.examples import expert
+        print("Using MetaDrive default expert (PPO model not found)")
+    except ImportError as e2:
+        print(f"Warning: No expert model available: {e2}")
+        def expert(agent):
+            """Dummy expert function when no model is available"""
+            return [0.0, 0.0]
 
 
 class ControlModeManager:
@@ -39,8 +61,13 @@ class ControlModeManager:
         self.engine = engine
         self.main_vehicle_trajectory = main_vehicle_trajectory
         
+        # 检查是否禁用PPO专家（训练时使用）
+        self.disable_ppo_expert = False
+        if engine and hasattr(engine, 'global_config'):
+            self.disable_ppo_expert = engine.global_config.get("disable_ppo_expert", False)
+        
         # 控制模式状态
-        self.expert_mode = True  # 是否使用 PPO 专家
+        self.expert_mode = True and not self.disable_ppo_expert  # 是否使用 PPO 专家
         self.use_trajectory_for_main = False  # 是否使用轨迹重放
         self.control_mode_changed = False  # 模式是否已切换
         
@@ -190,17 +217,16 @@ class ControlModeManager:
                 action_info = {"source": "trajectory", "success": True}
                 return [0.0, 0.0], action_info  # 空动作，状态由环境直接设置
                 
-        # 优先级2: PPO 专家模式
-        elif self.expert_mode and hasattr(self.agent, 'expert_takeover') and self.agent.expert_takeover:
+        # 优先级2: PPO 专家模式（如果未禁用）
+        elif self.expert_mode and not self.disable_ppo_expert and hasattr(self.agent, 'expert_takeover') and self.agent.expert_takeover:
             try:
                 action = expert(self.agent)
                 action_info = {"source": "expert", "success": True}
                 return action, action_info
-            except (ValueError, AssertionError) as e:
-                print(f"PPO 专家控制失败，切换到手动控制: {e}")
-                self.expert_mode = False
+            except (ValueError, AssertionError, FileNotFoundError) as e:
+                print(f"PPO 专家控制失败，使用默认动作: {e}")
                 action_info = {"source": "expert", "success": False, "error": str(e)}
-                return [0.0, 0.0], action_info
+                return default_action, action_info
                 
         # 优先级3: 手动控制模式
         elif not self.expert_mode and self.engine.global_config["manual_control"] and self.manual_policy:
@@ -223,14 +249,16 @@ class ControlModeManager:
         # 确定当前控制模式
         if self.use_trajectory_for_main:
             control_mode = "trajectory replay(vehicle-1)"
-        elif self.expert_mode:
+        elif self.expert_mode and not self.disable_ppo_expert:
             control_mode = "PPO expert"
+        elif self.disable_ppo_expert:
+            control_mode = "training mode (PPO disabled)"
         else:
             control_mode = "manual control"
             
         return {
             "Control Mode": control_mode,
-            "PPO Expert Status": "开启" if getattr(self.agent, 'expert_takeover', False) else "关闭",
+            "PPO Expert Status": "禁用(训练)" if self.disable_ppo_expert else ("开启" if getattr(self.agent, 'expert_takeover', False) else "关闭"),
             "Trajectory Mode": "开启" if self.use_trajectory_for_main else "关闭",
         }
         
