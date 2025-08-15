@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-认知偏差模块 - TTA（Time-To-Arrival）风险厌恶
-基于inverse_tta值动态调整奖励信号，模拟人类对风险的认知偏差
+认知偏差模块 - 独立实现，不依赖gym环境
+基于TTA（Time-To-Arrival）的视觉厌恶风险偏差调整
 
-核心功能：
-1. 根据环境中的inverse_tta值动态调整奖励
-2. 模拟人类对风险的认知偏差（风险厌恶）
-3. 支持自适应偏差调整
-4. 记录偏差历史用于分析
-
-该模块独立于gym环境，直接在MetaDrive环境中工作
+新增功能：
+- 视觉厌恶：基于主车车头方向30°范围内50m距离内的物体检测
+- 详细的检测历史记录和可视化
+- 支持可重现性控制
 """
 
 import numpy as np
@@ -17,6 +14,8 @@ import logging
 from typing import Dict, Any, Optional, Tuple, List
 from collections import deque
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import datetime
 import os
 
 logger = logging.getLogger(__name__)
@@ -24,65 +23,90 @@ logger = logging.getLogger(__name__)
 
 class CognitiveBiasModule:
     """
-    认知偏差模块 - 基于TTA的风险厌恶
+    认知偏差模块 - 基于TTA的风险厌恶偏差调整
     
-    功能：
-    1. 根据环境中的inverse_tta值动态调整奖励
-    2. 模拟人类对风险的认知偏差
-    3. 支持自适应偏差调整
+    支持视觉厌恶功能和可重现性控制
     """
     
-    def __init__(self, bias_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Dict[str, Any]):
         """
         初始化认知偏差模块
         
         Args:
-            bias_config: 偏差配置参数
+            config: 配置参数字典
         """
-        # 获取配置
-        config = bias_config or self._get_default_config()
+        self.config = self._get_default_config()
+        self.config.update(config)
         
-        # 核心参数
-        self.inverse_tta_coef = config.get('inverse_tta_coef', 1.0)  # 偏差强度系数
-        self.tta_threshold = config.get('tta_threshold', 1.0)  # TTA阈值
-        self.adaptive_bias = config.get('adaptive_bias', True)  # 自适应偏差
+        # 基础偏差参数
+        self.inverse_tta_coef = self.config['inverse_tta_coef']
+        self.tta_threshold = self.config['tta_threshold']
+        self.adaptive_bias = self.config['adaptive_bias']
+        self.adaptation_rate = self.config['adaptation_rate']
+        self.min_adaptive_factor = self.config['min_adaptive_factor']
+        self.max_adaptive_factor = self.config['max_adaptive_factor']
+        self.verbose = self.config['verbose']
         
         # 视觉厌恶参数
-        self.visual_detection_distance = config.get('visual_detection_distance', 50.0)  # 视觉检测距离
-        self.visual_detection_angle = np.radians(config.get('visual_detection_angle', 30.0))  # 转换为弧度
-        self.visual_aversion_strength = config.get('visual_aversion_strength', 0.5)  # 视觉厌恶强度
+        self.visual_detection_distance = self.config['visual_detection_distance']
+        self.visual_detection_angle = self.config['visual_detection_angle']
+        self.visual_aversion_strength = self.config['visual_aversion_strength']
         
-        # 自适应参数
-        self.adaptive_factor = 1.0
-        self.adaptation_rate = config.get('adaptation_rate', 0.01)
-        self.min_adaptive_factor = config.get('min_adaptive_factor', 0.5)
-        self.max_adaptive_factor = config.get('max_adaptive_factor', 2.0)
+        # 可重现性参数（新增）
+        self.random_seed = self.config.get('random_seed', None)
+        self.deterministic_mode = self.config.get('deterministic_mode', False)
+        self._random_state = None  # 独立的随机状态
         
-        # 历史记录（用于分析和自适应）
-        self.bias_history = deque(maxlen=config.get('history_length', 100))
-        self.reward_history = deque(maxlen=config.get('history_length', 100))
-        self.tta_history = deque(maxlen=config.get('history_length', 100))
+        # 初始化随机状态
+        self._initialize_random_state()
+        
+        # 历史记录
+        regular_history_length = self.config['history_length']
+        extended_history_length = self.config['extended_history_length']
+        
+        self.bias_history = deque(maxlen=regular_history_length)
+        self.reward_history = deque(maxlen=regular_history_length)
+        self.tta_history = deque(maxlen=regular_history_length)
+        self.adaptive_history = deque(maxlen=regular_history_length)
         
         # 视觉厌恶检测历史记录
         # 修复：增加历史记录长度以确保保留完整的数据，包括reset瞬间的27.8 m/s记录
-        extended_history_length = config.get('extended_history_length', 1000)  # 扩展到1000步
         self.detection_history = deque(maxlen=extended_history_length)  # 检测到的物体信息
         self.distance_history = deque(maxlen=extended_history_length)   # 最近威胁距离历史
         self.threat_count_history = deque(maxlen=extended_history_length)  # 威胁物体数量历史
         
-        # 统计变量
+        # 状态变量
+        self.adaptive_factor = 1.0
         self._step_count = 0
         self._total_bias = 0.0
-        self._active_steps = 0  # 偏差激活的步数
+        self._active_steps = 0
+        self._attached_env = None
         
-        # 附加的环境实例
-        self.attached_env = None
+        logger.info(f"CognitiveBiasModule初始化完成，视觉厌恶启用")
+        logger.info(f"检测参数: 距离={self.visual_detection_distance}m, 角度=±{self.visual_detection_angle}°, 强度={self.visual_aversion_strength}")
         
-        # 日志级别
-        self.verbose = config.get('verbose', False)
+        if self.deterministic_mode:
+            logger.info(f"✅ 确定性模式已启用，随机种子: {self.random_seed}")
+    
+    def _initialize_random_state(self):
+        """初始化随机状态以确保可重现性"""
+        if self.random_seed is not None:
+            # 创建独立的随机状态
+            self._random_state = np.random.RandomState(self.random_seed)
+            logger.info(f"认知偏差模块随机种子设置: {self.random_seed}")
+        else:
+            self._random_state = np.random.RandomState()
+    
+    def set_random_seed(self, seed: int):
+        """
+        设置随机种子（可重现性接口）
         
-        logger.info(f"CognitiveBiasModule初始化: inverse_tta_coef={self.inverse_tta_coef}, "
-                   f"tta_threshold={self.tta_threshold}, adaptive_bias={self.adaptive_bias}")
+        Args:
+            seed: 随机种子
+        """
+        self.random_seed = seed
+        self._initialize_random_state()
+        logger.info(f"认知偏差模块随机种子更新: {seed}")
     
     def _get_default_config(self) -> Dict[str, Any]:
         """获取默认配置"""
@@ -93,120 +117,93 @@ class CognitiveBiasModule:
             'adaptation_rate': 0.01,       # 自适应速率
             'min_adaptive_factor': 0.5,    # 最小自适应因子
             'max_adaptive_factor': 2.0,    # 最大自适应因子
-            'history_length': 100,         # 常规历史记录长度
-            'extended_history_length': 1000,  # 扩展历史记录长度（用于可视化分析）
+            'history_length': 100,         # 历史记录长度（用于自适应计算）
+            'extended_history_length': 1000,  # 扩展历史记录长度（用于可视化数据存储）
             'verbose': False,              # 详细日志输出
             
             # 视觉厌恶参数
             'visual_detection_distance': 50.0,  # 视觉检测距离（米）
             'visual_detection_angle': 30.0,     # 视觉检测角度（度）
-            'visual_aversion_strength': 0.5     # 视觉厌恶增强强度
+            'visual_aversion_strength': 0.5,    # 视觉厌恶增强强度
+            
+            # 可重现性参数（新增）
+            'random_seed': None,           # 随机种子
+            'deterministic_mode': False    # 确定性模式
         }
     
-    def attach_to_env(self, env):
+    def attach_to_env(self, env) -> bool:
         """
-        将偏差模块附加到MetaDrive环境
+        附加到环境
         
         Args:
-            env: MetaDrive环境实例
+            env: 环境实例
             
         Returns:
             bool: 是否成功附加
         """
         try:
-            self.attached_env = env
-            
-            # 检查环境是否支持获取inverse_tta
-            if not self._check_tta_support(env):
-                logger.warning("环境可能不支持inverse_tta功能")
-                return False
-            
-            logger.info("✅ 认知偏差模块已成功附加到环境")
+            self._attached_env = env
+            logger.info("认知偏差模块已附加到环境")
             return True
-            
         except Exception as e:
-            logger.error(f"❌ 附加认知偏差模块失败: {e}")
+            logger.error(f"认知偏差模块附加失败: {e}")
             return False
     
-    def _check_tta_support(self, env) -> bool:
-        """
-        检查环境是否支持inverse_tta
+    def detach_from_env(self):
+        """从环境分离"""
+        self._attached_env = None
+        logger.info("认知偏差模块已从环境分离")
+    
+    def reset(self):
+        """重置模块状态"""
+        self.bias_history.clear()
+        self.reward_history.clear()
+        self.tta_history.clear()
+        self.adaptive_history.clear()
         
-        Args:
-            env: 环境实例
-            
-        Returns:
-            bool: 是否支持
-        """
-        # 检查多种可能的TTA获取方式
-        has_tta = (
-            hasattr(env, 'current_inverse_tta') or
-            (hasattr(env, 'agent') and hasattr(env.agent, 'inverse_tta')) or
-            (hasattr(env, 'get_inverse_tta'))
-        )
+        # 清空新的历史记录
+        self.detection_history.clear()
+        self.distance_history.clear()
+        self.threat_count_history.clear()
         
-        if not has_tta:
-            # 尝试通过info字典获取
-            try:
-                # 模拟一步来检查info是否包含inverse_tta
-                # 这里只是检查，不实际执行
-                logger.info("环境未直接提供inverse_tta属性，将尝试从info字典获取")
-            except:
-                pass
+        self.adaptive_factor = 1.0
+        self._step_count = 0
+        self._total_bias = 0.0
+        self._active_steps = 0
         
-        return True  # 默认假设支持，实际运行时再处理
+        # 重置随机状态以确保可重现性
+        if self.deterministic_mode and self.random_seed is not None:
+            self._initialize_random_state()
+        
+        if self.verbose:
+            logger.info("认知偏差模块已重置")
     
     def get_inverse_tta(self, env, info: Optional[Dict] = None) -> Optional[float]:
         """
-        从环境中获取inverse_tta值
+        获取inverse_tta值
         
         Args:
             env: 环境实例
-            info: 可选的info字典
+            info: 信息字典
             
         Returns:
-            inverse_tta值，如果不存在则返回None
+            inverse_tta值，如果无法获取则返回None
         """
-        # 方式1：直接从环境属性获取
+        # 尝试多种方式获取inverse_tta
         if hasattr(env, 'current_inverse_tta'):
             return env.current_inverse_tta
-        
-        # 方式2：从agent获取
-        if hasattr(env, 'agent'):
-            agent = env.agent
-            if hasattr(agent, 'inverse_tta'):
-                return agent.inverse_tta
-            
-            # 尝试计算inverse_tta
-            if hasattr(agent, 'compute_inverse_tta'):
-                return agent.compute_inverse_tta()
-        
-        # 方式3：从环境方法获取
-        if hasattr(env, 'get_inverse_tta'):
-            return env.get_inverse_tta()
-        
-        # 方式4：从info字典获取
-        if info and 'inverse_tta' in info:
+        elif hasattr(env, 'agent') and hasattr(env.agent, 'inverse_tta'):
+            return env.agent.inverse_tta
+        elif info and 'inverse_tta' in info:
             return info['inverse_tta']
-        
-        # 方式5：尝试手动计算（如果有必要的信息）
-        if hasattr(env, 'agent'):
-            tta_value = self._compute_inverse_tta_manually(env)
-            if tta_value is not None:
-                return tta_value
-        
-        return None
+        else:
+            # 手动计算inverse_tta（基于视觉厌恶）
+            return self._compute_inverse_tta_manually(env)
     
     def _compute_inverse_tta_manually(self, env) -> Optional[float]:
         """
         手动计算inverse_tta（基于视觉厌恶）
         检测主车车头方向30°范围内的50m距离内的物体，应用视觉厌恶
-        
-        Args:
-            env: 环境实例
-            
-        Returns:
-            计算得到的inverse_tta值，如果无法计算则返回None
         """
         try:
             agent = env.agent
@@ -214,63 +211,86 @@ class CognitiveBiasModule:
             agent_heading = agent.heading_theta  # 主车朝向角度（弧度）
             agent_speed = agent.speed
             
-            # 视觉厌恶参数（使用配置参数）
+            # 视觉厌恶参数
             max_detection_distance = self.visual_detection_distance  # 最大检测距离
-            detection_angle = self.visual_detection_angle  # 车头方向检测角度范围
+            detection_angle = np.radians(self.visual_detection_angle)  # 车头方向检测角度范围（转换为弧度）
             
             min_threat_distance = float('inf')
             threat_detected = False
             threat_count = 0
             detected_objects = []  # 记录检测到的物体信息
             
-            # 方法1：从雷达检测结果中获取威胁物体
-            if hasattr(agent, 'lidar') and hasattr(agent.lidar, 'detected_objects'):
-                for obj in agent.lidar.detected_objects:
-                    if hasattr(obj, 'distance') and hasattr(obj, 'angle'):
-                        obj_distance = obj.distance
-                        obj_angle = obj.angle  # 相对于主车的角度
-                        
-                        # 检查距离是否在50m内
-                        if obj_distance <= max_detection_distance:
-                            # 检查角度是否在车头方向±30度内
-                            angle_diff = abs(obj_angle - agent_heading)
-                            # 处理角度环绕问题
-                            if angle_diff > np.pi:
-                                angle_diff = 2 * np.pi - angle_diff
+            # 方法1：从雷达数据中检测威胁物体
+            # MetaDrive的雷达返回距离数组，需要转换为物体检测
+            if hasattr(agent, 'lidar'):
+                try:
+                    # 获取雷达观测数据（从观测向量中提取）
+                    from metadrive.obs.observation_base import ObservationBase
+                    if hasattr(env, 'engine') and hasattr(env.engine, 'get_sensor'):
+                        lidar_sensor = env.engine.get_sensor('lidar')
+                        if lidar_sensor and hasattr(agent, 'vehicle'):
+                            # 直接从传感器获取距离数据
+                            lidar_result, _ = lidar_sensor.perceive(
+                                agent, env.engine.physics_world, 
+                                num_lasers=240, distance=50.0
+                            )
                             
-                            if angle_diff <= detection_angle:
-                                min_threat_distance = min(min_threat_distance, obj_distance)
-                                threat_detected = True
-                                threat_count += 1
-                                detected_objects.append({
-                                    'source': 'lidar',
-                                    'distance': obj_distance,
-                                    'angle': obj_angle,
-                                    'angle_diff': np.degrees(angle_diff)
-                                })
+                            # 转换雷达数据为物体检测
+                            if lidar_result and len(lidar_result) >= 240:
+                                # 240个激光射线，每1.5度一个 (360度/240 = 1.5度)
+                                angle_step = 2 * np.pi / 240  # 每个射线的角度间隔
+                                
+                                for i, normalized_distance in enumerate(lidar_result):
+                                    if normalized_distance < 1.0:  # 检测到物体 (归一化距离 < 1.0)
+                                        actual_distance = normalized_distance * 50.0  # 转换为实际距离
+                                        
+                                        if actual_distance <= max_detection_distance and actual_distance > 0.5:
+                                            # 计算射线角度（相对于主车坐标系）
+                                            ray_angle = i * angle_step  # 射线在雷达坐标系中的角度
+                                            # 转换为世界坐标系角度
+                                            world_angle = agent_heading + ray_angle
+                                            
+                                            # 计算与车头方向的角度差
+                                            forward_angle_diff = min(ray_angle, 2*np.pi - ray_angle)
+                                            
+                                            if forward_angle_diff <= detection_angle:
+                                                min_threat_distance = min(min_threat_distance, actual_distance)
+                                                threat_detected = True
+                                                threat_count += 1
+                                                detected_objects.append({
+                                                    'source': 'lidar',
+                                                    'distance': actual_distance,
+                                                    'ray_index': i,
+                                                    'ray_angle': np.degrees(ray_angle),
+                                                    'world_angle': np.degrees(world_angle),
+                                                    'angle_diff': np.degrees(forward_angle_diff)
+                                                })
+                except Exception as e:
+                    if self.verbose:
+                        logger.debug(f"雷达检测失败: {e}")
             
             # 方法2：检查环境中的背景车辆
             if hasattr(env, 'ghost_vehicles') and env.ghost_vehicles:
                 for vehicle_id, vehicle in env.ghost_vehicles.items():
                     if hasattr(vehicle, 'position'):
                         v_pos = vehicle.position
-                         
+                        
                         # 计算相对位置
                         dx = v_pos[0] - agent_pos[0]
                         dy = v_pos[1] - agent_pos[1]
                         distance = np.sqrt(dx**2 + dy**2)
-                         
+                        
                         # 检查距离是否在50m内
                         if distance <= max_detection_distance and distance > 0:
                             # 计算相对角度
                             relative_angle = np.arctan2(dy, dx)
-                             
+                            
                             # 计算与主车朝向的角度差
                             angle_diff = abs(relative_angle - agent_heading)
                             # 处理角度环绕问题
                             if angle_diff > np.pi:
                                 angle_diff = 2 * np.pi - angle_diff
-                             
+                            
                             # 检查是否在车头方向±30度内
                             if angle_diff <= detection_angle:
                                 min_threat_distance = min(min_threat_distance, distance)
@@ -298,6 +318,12 @@ class CognitiveBiasModule:
                     
                     inverse_tta = basic_inverse_tta * visual_aversion_factor
                     
+                    # 在确定性模式下，添加可控的"随机"因子以模拟认知不确定性
+                    if self.deterministic_mode and self._random_state is not None:
+                        # 使用确定性的伪随机因子，基于当前状态
+                        uncertainty_factor = 1.0 + 0.05 * np.sin(self._step_count * 0.1)  # 周期性变化
+                        inverse_tta *= uncertainty_factor
+                    
                     # 记录检测信息
                     detection_info = {
                         'threat_count': threat_count,
@@ -314,8 +340,8 @@ class CognitiveBiasModule:
                     
                     if self.verbose:
                         logger.debug(f"视觉威胁检测: 威胁数量={threat_count}, 最近距离={min_threat_distance:.1f}m, "
-                                   f"速度={agent_speed:.1f}m/s, 视觉厌恶因子={visual_aversion_factor:.2f}, "
-                                   f"基础inverse_tta={basic_inverse_tta:.3f}, 最终inverse_tta={inverse_tta:.3f}")
+                                    f"速度={agent_speed:.1f}m/s, 视觉厌恶因子={visual_aversion_factor:.2f}, "
+                                    f"基础inverse_tta={basic_inverse_tta:.3f}, 最终inverse_tta={inverse_tta:.3f}")
                         for obj in detected_objects:
                             logger.debug(f"  - {obj['source']}: 距离={obj['distance']:.1f}m, 角度差={obj['angle_diff']:.1f}°")
                     
@@ -342,8 +368,8 @@ class CognitiveBiasModule:
                     total_objects = len(env.ghost_vehicles)
                 
                 logger.debug(f"视觉威胁检测: 未检测到威胁, 速度={agent_speed:.1f}m/s, "
-                           f"总背景车数量={total_objects}, 检测距离={max_detection_distance}m, "
-                           f"检测角度=±{np.degrees(detection_angle):.1f}°")
+                            f"总背景车数量={total_objects}, 检测距离={max_detection_distance}m, "
+                            f"检测角度=±{np.degrees(detection_angle):.1f}°")
             
             # 如果没有检测到威胁，返回低威胁值
             return 0.1 if agent_speed > 0 else 0.0
@@ -479,31 +505,6 @@ class CognitiveBiasModule:
                     self.min_adaptive_factor,
                     self.adaptive_factor - self.adaptation_rate * 0.5
                 )
-    
-    def reset(self):
-        """重置认知偏差模块状态"""
-        # 清空历史记录
-        self.bias_history.clear()
-        self.reward_history.clear()
-        self.tta_history.clear()
-        self.detection_history.clear()
-        self.distance_history.clear()
-        self.threat_count_history.clear()
-        
-        # 重置统计变量
-        self._step_count = 0
-        self._total_bias = 0.0
-        self._active_steps = 0
-        
-        # 重置自适应因子
-        self.adaptive_factor = 1.0
-        
-        logger.info("CognitiveBiasModule已重置")
-    
-    def detach_from_env(self):
-        """从环境中分离偏差模块"""
-        self.attached_env = None
-        logger.info("认知偏差模块已从环境分离")
     
     def get_statistics(self) -> Dict[str, Any]:
         """
