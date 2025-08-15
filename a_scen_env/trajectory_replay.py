@@ -849,6 +849,9 @@ class TrajectoryReplayEnv(MetaDriveEnv):
         # 重放背景车（基于仿真时间而非步数）
         self._replay_all_vehicles_by_time()
         
+        # 检查并清理已结束轨迹的背景车
+        self._cleanup_finished_trajectories()
+        
         self._step_count += 1
         
         # 每10步输出速度对比信息，检查同步效果
@@ -899,6 +902,81 @@ class TrajectoryReplayEnv(MetaDriveEnv):
             except:
                 pass  # 忽略销毁失败的情况
         self.ghost_vehicles = {}
+
+    def _cleanup_finished_trajectories(self):
+        """
+        检查并清理已结束轨迹的背景车
+        """
+        if not self.enable_background_vehicles:
+            return
+            
+        # 检查每辆背景车的轨迹状态
+        vehicles_to_remove = []
+        
+        for vid, vehicle in self.ghost_vehicles.items():
+            if vid in self.trajectory_dict:
+                traj = self.trajectory_dict[vid]
+                # 检查轨迹是否已结束
+                if self._is_trajectory_finished(traj, self._simulation_time):
+                    vehicles_to_remove.append(vid)
+        
+        # 移除已结束轨迹的车辆
+        for vid in vehicles_to_remove:
+            if vid in self.ghost_vehicles:
+                vehicle = self.ghost_vehicles[vid]
+                print(f"🚗 背景车 {vid} 轨迹已结束，正在移除...")
+                try:
+                    vehicle.destroy()
+                    print(f"✅ 背景车 {vid} 已成功移除")
+                except Exception as e:
+                    print(f"⚠️ 背景车 {vid} 移除时出错: {e}")
+                del self.ghost_vehicles[vid]
+                
+        # 如果所有背景车都已移除，显示状态
+        if len(self.ghost_vehicles) == 0 and self.trajectory_dict:
+            print(f"📊 所有背景车轨迹已结束，当前场景中只有主车")
+        elif len(vehicles_to_remove) > 0:
+            print(f"📊 已移除 {len(vehicles_to_remove)} 辆背景车，剩余 {len(self.ghost_vehicles)} 辆")
+
+    def _is_trajectory_finished(self, trajectory, sim_time):
+        """
+        检查轨迹是否已结束
+        
+        Args:
+            trajectory: 车辆轨迹数据
+            sim_time: 当前仿真时间
+            
+        Returns:
+            bool: 轨迹是否已结束
+        """
+        if not trajectory:
+            return True
+            
+        # 计算目标时间戳
+        target_time = self._trajectory_start_time + sim_time
+        
+        # 检查是否有原始时间戳
+        if "original_timestamp" in trajectory[0]:
+            last_timestamp = trajectory[-1]["original_timestamp"]
+            is_finished = target_time > last_timestamp
+            if is_finished:
+                print(f"  📊 轨迹检查: 当前时间 {target_time:.1f}s > 最后时间戳 {last_timestamp:.1f}s")
+            return is_finished
+        # 检查是否有插值时间戳
+        elif "timestamp" in trajectory[0]:
+            last_timestamp = trajectory[-1]["timestamp"]
+            is_finished = target_time > last_timestamp
+            if is_finished:
+                print(f"  📊 轨迹检查: 当前时间 {target_time:.1f}s > 最后时间戳 {last_timestamp:.1f}s")
+            return is_finished
+        else:
+            # 如果没有时间戳，基于步数判断
+            max_steps = len(trajectory)
+            current_step = int(sim_time / self.physics_world_step_size)
+            is_finished = current_step >= max_steps
+            if is_finished:
+                print(f"  📊 轨迹检查: 当前步数 {current_step} >= 最大步数 {max_steps}")
+            return is_finished
 
     def _initialize_trajectory_start_time(self):
         """
@@ -1040,7 +1118,7 @@ class TrajectoryReplayEnv(MetaDriveEnv):
              直接设置位置（kinematic模式）
           2) dynamics模式：使用CSV中的speed_x, speed_y通过物理引擎更新车辆，
              更真实地模拟车辆运动
-        - 当轨迹结束时，当前实现选择移除车辆。
+        - 当轨迹结束时，自动移除车辆并清理资源
         - 根据enable_background_vehicles参数决定是否启用背景车
         """
         # 如果禁用背景车，直接返回
@@ -1055,7 +1133,12 @@ class TrajectoryReplayEnv(MetaDriveEnv):
                 if vid in self.ghost_vehicles:
                     # 移除车辆
                     vehicle = self.ghost_vehicles[vid]
-                    vehicle.destroy()
+                    print(f"🚗 背景车 {vid} 轨迹结束，正在移除...")
+                    try:
+                        vehicle.destroy()
+                        print(f"✅ 背景车 {vid} 已成功移除")
+                    except Exception as e:
+                        print(f"⚠️ 背景车 {vid} 移除时出错: {e}")
                     del self.ghost_vehicles[vid]
                 continue
 
@@ -1338,7 +1421,7 @@ if __name__ == "__main__":
             use_render=True, 
             manual_control=True,
             background_vehicle_update_mode="position",  # 可选: "position" 或 "dynamics"
-            enable_background_vehicles=False,  # 是否启用背景车（默认True）
+            enable_background_vehicles=True,  # 是否启用背景车（默认True）
             enable_realtime=True,  # 启用实时模式，使仿真以真实时间速度运行
             target_fps=50.0,       # 目标帧率，匹配物理步长 (50Hz = 0.02s per step)
         )

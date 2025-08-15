@@ -258,8 +258,8 @@ class ControlModeManager:
             
         return {
             "Control Mode": control_mode,
-            "PPO Expert Status": "禁用(训练)" if self.disable_ppo_expert else ("开启" if getattr(self.agent, 'expert_takeover', False) else "关闭"),
-            "Trajectory Mode": "开启" if self.use_trajectory_for_main else "关闭",
+            "PPO Expert Status": "Disabled(Training)" if self.disable_ppo_expert else ("On" if getattr(self.agent, 'expert_takeover', False) else "Off"),
+            "Trajectory Mode": "On" if self.use_trajectory_for_main else "Off",
         }
         
     def reset_modes(self):
