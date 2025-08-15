@@ -21,9 +21,9 @@ if cognitive_module_dir not in sys.path:
     sys.path.insert(0, cognitive_module_dir)
 
 # 导入认知模块
-from cognitive_wrappers import PerceptionWrapper, CognitiveBiasWrapper, DelayWrapper
 from cognitive_perception_module import CognitivePerceptionModule
 from cognitive_bias_module import CognitiveBiasModule  # 新增：导入认知偏差模块
+from cognitive_delay_module import CognitiveDelayModule  # 导入独立的延迟模块
 
 # 导入可视化模块
 from cognitive_visualization import CognitiveDataRecorder, CognitiveVisualizer
@@ -34,68 +34,6 @@ from trajectory_loader import TrajectoryLoader, load_trajectory
 from metadrive.component.navigation_module.node_network_navigation import NodeNetworkNavigation
 from observation_recorder import ObservationRecorder
 
-
-class CognitiveDelayModule:
-    """
-    认知延迟模块 - 独立实现，不依赖gym环境
-    仅在PPO模式下应用执行延迟
-    """
-    def __init__(self, delay_steps=2, enable_smoothing=True, smoothing_factor=0.3):
-        self.delay_steps = delay_steps
-        self.enable_smoothing = enable_smoothing
-        self.smoothing_factor = smoothing_factor
-        
-        from collections import deque
-        self.buffer = deque(maxlen=delay_steps + 1)
-        self.previous_action = np.array([0.0, 0.0])
-        
-    def process_action(self, action, is_ppo_mode=False):
-        """
-        处理动作，仅在PPO模式下应用延迟
-        
-        Args:
-            action: 原始动作
-            is_ppo_mode: 是否为PPO专家模式
-            
-        Returns:
-            处理后的动作
-        """
-        if not is_ppo_mode:
-            return action  # 非PPO模式直接返回原始动作
-            
-        # 确保action是numpy数组
-        action = np.array(action, dtype=np.float32)
-        
-        # 记录原始命令供可视化使用
-        self._last_commanded_action = action.copy()
-
-        # 动作平滑（如果启用）
-        if self.enable_smoothing:
-            smoothed_action = (
-                self.smoothing_factor * action +
-                (1 - self.smoothing_factor) * self.previous_action
-            )
-            self.previous_action = smoothed_action.copy()
-        else:
-            smoothed_action = action
-        
-        # 添加到延迟缓冲区
-        self.buffer.append(smoothed_action.copy())
-        
-        # 获取延迟后的动作
-        if len(self.buffer) <= self.delay_steps:
-            # 初始几步返回零动作
-            delayed_action = np.array([0.0, 0.0])
-        else:
-            # 返回延迟的动作
-            delayed_action = self.buffer[0]
-        
-        return delayed_action
-    
-    def reset(self):
-        """重置延迟模块"""
-        self.buffer.clear()
-        self.previous_action = np.array([0.0, 0.0])
 
 
 class TrajectoryReplayEnvCognitive(MetaDriveEnv):
@@ -918,6 +856,38 @@ class TrajectoryReplayEnvCognitive(MetaDriveEnv):
                 print(f"  总偏差: {stats['total_bias']:.2f}")
             except Exception as e:
                 print(f"❌ 生成认知偏差分析图表失败: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # 生成延迟模块的可视化（新增）
+        if self.enable_cognitive_modules and self.delay_module and hasattr(self.delay_module, 'generate_delay_visualization'):
+            try:
+                print(f"\n开始生成延迟效果分析图表...")
+                from datetime import datetime
+                session_name = f"delay_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                
+                # 创建延迟模块专用目录
+                delay_output_dir = os.path.join(self.visualization_output_dir, "cognitive_delay")
+                os.makedirs(delay_output_dir, exist_ok=True)
+                
+                delay_file = self.delay_module.generate_delay_visualization(
+                    output_dir=delay_output_dir,
+                    session_name=session_name
+                )
+                if delay_file:
+                    print(f"✅ 延迟效果分析图表已保存到 {delay_file}")
+                    
+                    # 打印延迟模块统计信息
+                    status = self.delay_module.get_status()
+                    print(f"\n延迟模块统计信息:")
+                    print(f"  延迟步数: {status['delay_steps']}")
+                    print(f"  动作平滑: {'启用' if status['enable_smoothing'] else '禁用'}")
+                    print(f"  平滑系数: {status['smoothing_factor']:.3f}")
+                    print(f"  记录步数: {status.get('recorded_steps', 0)}")
+                else:
+                    print(f"⚠️ 延迟模块没有生成可视化（可能无数据记录）")
+            except Exception as e:
+                print(f"❌ 生成延迟效果分析图表失败: {e}")
                 import traceback
                 traceback.print_exc()
         
