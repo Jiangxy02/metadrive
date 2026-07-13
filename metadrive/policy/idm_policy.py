@@ -213,7 +213,7 @@ class IDMPolicy(BasePolicy):
     MAX_SPEED = 100  # km/h
 
     # Normal speed
-    NORMAL_SPEED = 30  # km/h
+    NORMAL_SPEED = 80  # km/h
 
     # Creep Speed
     CREEP_SPEED = 5
@@ -224,7 +224,7 @@ class IDMPolicy(BasePolicy):
 
     def __init__(self, control_object, random_seed):
         super(IDMPolicy, self).__init__(control_object=control_object, random_seed=random_seed)
-        self.target_speed = self.NORMAL_SPEED
+        self.target_speed = self.np_random.uniform(60, self.NORMAL_SPEED)
         self.routing_target_lane = None
         self.available_routing_index_range = None
         self.overtake_timer = self.np_random.randint(0, self.LANE_CHANGE_FREQ)
@@ -435,7 +435,7 @@ class ManualControllableIDMPolicy(IDMPolicy):
 
 class TrajectoryIDMPolicy(IDMPolicy):
     """This policy is customized for the traffic car in Waymo environment. (Ego car is not included!)"""
-    NORMAL_SPEED = 40
+    NORMAL_SPEED = 80
     IDM_MAX_DIST = 20
     DEST_REGION_RADIUS = 2  # m
 
@@ -444,7 +444,7 @@ class TrajectoryIDMPolicy(IDMPolicy):
         self.policy_index = policy_index
         assert isinstance(traj_to_follow, PointLane), "Trajectory of IDM policy should be in PointLane Class"
         self.traj_to_follow = traj_to_follow
-        self.target_speed = self.NORMAL_SPEED
+        self.target_speed = self.np_random.uniform(60, self.NORMAL_SPEED)
         self.routing_target_lane = self.traj_to_follow
         self.destination = np.asarray(self.traj_to_follow.end)
         self.available_routing_index_range = None

@@ -27,9 +27,13 @@ logger = get_logger()
 
 
 def _clean_a_node_path(node_path):
-    if not node_path.isEmpty():
-        for sub_node_path in node_path.getChildren():
-            _clean_a_node_path(sub_node_path)
+    """Recursively remove a non-empty Panda3D NodePath tree."""
+    if node_path is None or not isinstance(node_path, NodePath):
+        return
+    if node_path.isEmpty():
+        return
+    for sub_node_path in node_path.getChildren():
+        _clean_a_node_path(sub_node_path)
     node_path.detachNode()
     node_path.removeNode()
 
@@ -253,7 +257,7 @@ class BaseObject(BaseRunnable, MetaDriveType, ABC):
             logger.debug("Object {} is already detached from the world. Can not detach again".format(self.class_name))
 
     def is_attached(self):
-        return self.origin is not None and self.origin.hasParent()
+        return self.origin is not None and not self.origin.isEmpty() and self.origin.hasParent()
 
     def destroy(self):
         """
@@ -271,7 +275,7 @@ class BaseObject(BaseRunnable, MetaDriveType, ABC):
                     self.detach_from_world(engine.physics_world)
                 if self._body is not None and hasattr(self.body, "object"):
                     self.body.generated_object = None
-                if self.origin is not None:
+                if self.origin is not None and not self.origin.isEmpty():
                     self.origin.removeNode()
 
                 self.dynamic_nodes.destroy_node_list()
